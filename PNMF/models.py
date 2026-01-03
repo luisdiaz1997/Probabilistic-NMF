@@ -92,8 +92,7 @@ class PoissonFactorization(nn.Module):
         """
         F = torch.exp(prior_samples)  # shape (E, L, N)
         W = self.W.data  # shape (D, L)
-        # Z = W @ F gives (E, D, N)
-        Z = torch.matmul(F.transpose(1, 2), W.T).transpose(1, 2)
+        Z = torch.matmul(W, F)  # shape (E, D, N)
         return Z
 
     def forward(self, E=10):
