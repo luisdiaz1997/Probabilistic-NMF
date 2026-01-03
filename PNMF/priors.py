@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 from torch import distributions
 
+from .custom_modules import PositiveParameter
+
 
 class GaussianPrior(nn.Module):
     """
@@ -25,7 +27,7 @@ class GaussianPrior(nn.Module):
 
     Attributes:
         mean: Variational mean parameter of shape (L, N)
-        scale: Variational scale parameter (raw, before softplus) of shape (L, N)
+        scale: PositiveParameter for scale (uses softplus internally) of shape (L, N)
         scale_pf: Fixed scale for the prior distribution
 
     Example:
@@ -45,7 +47,8 @@ class GaussianPrior(nn.Module):
 
         # Variational parameters
         self.mean = nn.Parameter(torch.randn(L, N))
-        self.scale = nn.Parameter(torch.rand(L, N))
+        # Use PositiveParameter with softplus for scale (ensures positivity)
+        self.scale = PositiveParameter((L, N), mode='softplus')
 
         # Prior hyperparameter (fixed)
         self.scale_pf = scale_pf
@@ -55,11 +58,11 @@ class GaussianPrior(nn.Module):
         Get the variational and prior distributions.
 
         Returns:
-            qF: Variational posterior distribution Normal(mean, softplus(scale))
+            qF: Variational posterior distribution Normal(mean, scale.data)
             pF: Prior distribution Normal(0, scale_pf)
         """
-        scale = torch.nn.functional.softplus(self.scale)
-        qF = distributions.Normal(self.mean, scale)
+        # PositiveParameter.data already applies softplus transformation
+        qF = distributions.Normal(self.mean, self.scale.data)
         pF = distributions.Normal(
             torch.zeros_like(qF.mean),
             self.scale_pf * torch.ones_like(qF.scale)
@@ -77,10 +80,16 @@ class GaussianPrior(nn.Module):
             qF: Variational distribution for the batch
             pF: Prior distribution for the batch
         """
-        scale = torch.nn.functional.softplus(self.scale[:, idx])
-        qF = distributions.Normal(self.mean[:, idx], scale)
+        # Index into PositiveParameter - .data applies softplus
+        scale_batched = self.scale.data[:, idx]
+        qF = distributions.Normal(self.mean[:, idx], scale_batched)
         pF = distributions.Normal(
             torch.zeros_like(qF.mean),
             self.scale_pf * torch.ones_like(qF.scale)
         )
         return qF, pF
+
+    def parameters(self):
+        """Return parameters for optimization (excludes the prior hyperparameter)."""
+        yield self.mean
+        yield from self.scale.parameters()
