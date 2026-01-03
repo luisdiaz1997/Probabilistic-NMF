@@ -55,16 +55,16 @@ Mathematical Formulation
 Model
 ~~~~~
 
-The PNMF model factorizes a non-negative matrix :math:`X \in \mathbb{R}_{+}^{N \\times D}` as:
+The PNMF model factorizes a non-negative matrix :math:`X \in \mathbb{R}_{+}^{N \times D}` as:
 
 .. math::
 
-   X \\approx W @ \\exp(F)
+   X \approx W @ \exp(F)
 
 where:
 
-- :math:`W \\in \\mathbb{R}_{+}^{D \\times L}` are the loadings (learned parameters)
-- :math:`F \\in \\mathbb{R}^{L \\times N}` are the latent factors (random variables)
+- :math:`W \in \mathbb{R}_{+}^{D \times L}` are the loadings (learned parameters)
+- :math:`F \in \mathbb{R}^{L \times N}` are the latent factors (random variables)
 
 Variational Inference
 ~~~~~~~~~~~~~~~~~~~~~
@@ -76,12 +76,12 @@ The Evidence Lower BOund (ELBO) is:
 
 .. math::
 
-   \\mathcal{L} = \\mathbb{E}_{q(F)}[\\log p(X|F)] - \\text{KL}[q(F) \\,||\\, p(F)]
+   \mathcal{L} = \mathbb{E}_{q(F)}[\log p(X|F)] - \text{KL}[q(F) \,||\, p(F)]
 
 where:
 
-- :math:`\\mathbb{E}_{q(F)}[\\log p(X|F)]` is the expected log-likelihood under the Poisson model
-- :math:`\\text{KL}[q(F) \\,||\\, p(F)]` is the KL divergence between the variational and prior distributions
+- :math:`\mathbb{E}_{q(F)}[\log p(X|F)]` is the expected log-likelihood under the Poisson model
+- :math:`\text{KL}[q(F) \,||\, p(F)]` is the KL divergence between the variational and prior distributions
 
 Optimization
 ~~~~~~~~~~~~
