@@ -50,6 +50,9 @@ class PoissonFactorization(nn.Module):
         y: Input data tensor of shape (D, N) where D is features, N is samples
         L: Number of latent components (default: 10)
         loadings_mode: Mode for enforcing positivity on W ('softplus', 'exp', or 'projected')
+        mode: ELBO computation mode ('simple' or 'expanded')
+            - 'simple': Use torch.distributions.Poisson.log_prob() directly
+            - 'expanded': Use hybrid Monte Carlo + analytic expectation (default)
 
     Attributes:
         prior: GaussianPrior for variational inference
@@ -69,10 +72,11 @@ class PoissonFactorization(nn.Module):
         >>> rate, qF, pF = model(E=10)
     """
 
-    def __init__(self, prior, y, L=10, loadings_mode='softplus'):
+    def __init__(self, prior, y, L=10, loadings_mode='softplus', mode='expanded'):
         super().__init__()
         self.prior = prior
         self.loadings_mode = loadings_mode
+        self.mode = mode
         D, N = y.shape
         self.D = D
         self.N = N
@@ -143,6 +147,11 @@ class PNMF:
         - 'exp': Use exponential transformation
         - 'projected': Use projected gradient descent (clamp after each step)
 
+    mode : {'simple', 'expanded'}, default='expanded'
+        ELBO computation mode:
+        - 'simple': Use torch.distributions.Poisson.log_prob() directly
+        - 'expanded': Use hybrid Monte Carlo + analytic expectation (default)
+
     E : int, default=10
         Number of Monte Carlo samples for ELBO estimation.
 
@@ -196,6 +205,7 @@ class PNMF:
         self,
         n_components: int = 10,
         loadings_mode: str = 'projected',
+        mode: str = 'expanded',
         E: int = 3,
         max_iter: int = 200,
         tol: float = 1e-4,
@@ -206,6 +216,7 @@ class PNMF:
     ):
         self.n_components = n_components
         self.loadings_mode = loadings_mode
+        self.mode = mode
         self.E = E
         self.max_iter = max_iter
         self.tol = tol
@@ -231,6 +242,9 @@ class PNMF:
         if self.loadings_mode not in ['softplus', 'exp', 'projected']:
             raise ValueError("loadings_mode must be 'softplus', 'exp', or 'projected'")
 
+        if self.mode not in ['simple', 'expanded']:
+            raise ValueError("mode must be 'simple' or 'expanded'")
+
         if self.max_iter < 1:
             raise ValueError("max_iter must be >= 1")
 
@@ -250,6 +264,76 @@ class PNMF:
         return torch.device(self.device)
 
     def _elbo(self, rate, qF, pF, X):
+        """
+        Compute the Evidence Lower BOund (ELBO).
+
+        This method dispatches to the appropriate ELBO computation based on self.mode:
+        - 'simple': Uses torch.distributions.Poisson.log_prob() directly
+        - 'expanded': Uses hybrid Monte Carlo + analytic expectation
+
+        ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+
+        Args:
+            rate: Poisson rate tensor of shape (E, D, N)
+            qF: Variational posterior distribution with mean and scale
+            pF: Prior distribution
+            X: Input data tensor of shape (D, N)
+
+        Returns:
+            Negative ELBO (to minimize)
+        """
+        if self.mode == 'simple':
+            return self._elbo_simple(rate, qF, pF, X)
+        else:  # 'expanded'
+            return self._elbo_expanded(rate, qF, pF, X)
+
+    def _elbo_simple(self, rate, qF, pF, X):
+        """
+        Compute ELBO using full Monte Carlo estimation.
+
+        This uses pure Monte Carlo estimation for all terms in the Poisson
+        log-likelihood, without any analytic simplification. This is equivalent
+        to using torch.distributions.Poisson.log_prob() but works with continuous data.
+
+        ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+
+        The Poisson log-likelihood is:
+            log p(X|rate) = X * log(rate) - rate - log(X!)
+
+        where log(X!) is computed using lgamma(X+1) for continuous X.
+
+        Args:
+            rate: Poisson rate tensor of shape (E, D, N)
+            qF: Variational posterior distribution with mean and scale
+            pF: Prior distribution
+            X: Input data tensor of shape (D, N)
+
+        Returns:
+            Negative ELBO (to minimize)
+        """
+        E_samples = rate.shape[0]
+
+        # Expand X to match rate shape: (D, N) -> (E, D, N)
+        X_expanded = X.unsqueeze(0).expand(E_samples, -1, -1)
+
+        # Compute Poisson log-likelihood manually (works with continuous X)
+        # log p(X|rate) = X * log(rate) - rate - log(X!)
+        eps = 1e-8
+        rate_clamped = rate.clamp(min=eps)
+
+        # All terms estimated via Monte Carlo
+        log_lik_mc = (X_expanded * torch.log(rate_clamped) - rate_clamped - torch.lgamma(X_expanded + 1))
+
+        # Expected log likelihood via Monte Carlo: (1/E) * sum_e log p(Y|F_e)
+        log_lik = log_lik_mc.sum() / E_samples
+
+        # KL divergence
+        kl = torch.distributions.kl_divergence(qF, pF).sum()
+
+        # Negative ELBO (for minimization)
+        return kl - log_lik
+
+    def _elbo_expanded(self, rate, qF, pF, X):
         """
         Compute the Evidence Lower BOund (ELBO) using the expanded expectation form.
 
@@ -356,7 +440,8 @@ class PNMF:
             prior=self._prior,
             y=X_torch,
             L=self.n_components,
-            loadings_mode=self.loadings_mode
+            loadings_mode=self.loadings_mode,
+            mode=self.mode
         ).to(self._get_device())
 
         # Setup optimizer (W parameters + prior parameters)
@@ -367,7 +452,7 @@ class PNMF:
         prev_elbo = float('-inf')
 
         # Create progress bar
-        pbar = tqdm(range(self.max_iter), disable=self.verbose, desc="PNMF fitting")
+        pbar = tqdm(range(self.max_iter), disable=self.verbose, desc=f"PNMF fitting ({self.mode} mode)")
 
         for iteration in pbar:
             optimizer.zero_grad()
