@@ -10,6 +10,8 @@ import torch.nn as nn
 import numpy as np
 from typing import Optional, Union
 
+from tqdm.auto import tqdm
+
 from .custom_modules import PositiveParameter
 from .priors import GaussianPrior
 
@@ -252,11 +254,12 @@ class PNMF:
         Compute the Evidence Lower BOund (ELBO) using the expanded expectation form.
 
         The expected log-likelihood is computed as:
-            E[log p(Y|F)] = Y * E[log(sum(W * exp(F)))] - sum(W * E[exp(F)])
+            E[log p(Y|F)] = Y * E[log(sum(W * exp(F)))] - sum(W * E[exp(F)]) - sum(log(Y!))
 
         where:
         - The first term uses Monte Carlo estimation (requires log of sum)
         - The second term is computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
+        - The third term is the Poisson normalization constant (log factorial)
 
         ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
 
@@ -294,8 +297,9 @@ class PNMF:
         W = self._model.W.data  # (D, L)
         term2_analytic = torch.matmul(W, exp_expectation).sum()  # scalar
 
-        # Expected log likelihood (excluding constant -log(Y!) term)
-        log_lik = term1_mc - term2_analytic
+        # Expected log likelihood (including the Poisson normalization -log(Y!) term)
+        # Using lgamma(X+1) = log(X!) for the Poisson PMF normalization
+        log_lik = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
 
         # KL divergence
         kl = torch.distributions.kl_divergence(qF, pF).sum()
@@ -362,7 +366,10 @@ class PNMF:
         # Training loop
         prev_elbo = float('-inf')
 
-        for iteration in range(self.max_iter):
+        # Create progress bar
+        pbar = tqdm(range(self.max_iter), disable=self.verbose, desc="PNMF fitting")
+
+        for iteration in pbar:
             optimizer.zero_grad()
 
             # Forward pass
@@ -381,12 +388,21 @@ class PNMF:
 
             # Check convergence
             elbo_value = -loss.item()  # Convert back to ELBO
-            if self.verbose and iteration % 10 == 0:
-                print(f"Iteration {iteration}: ELBO = {elbo_value:.6f}")
+
+            if self.verbose:
+                # Use print statements for verbose mode
+                if iteration % 10 == 0:
+                    print(f"Iteration {iteration}: ELBO = {elbo_value:.6f}")
+            else:
+                # Update tqdm progress bar with ELBO
+                pbar.set_postfix({"ELBO": f"{elbo_value:.6f}"})
 
             if abs(elbo_value - prev_elbo) < self.tol:
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
+                else:
+                    pbar.set_postfix({"ELBO": f"{elbo_value:.6f}", "status": "converged"})
+                    pbar.close()
                 break
 
             prev_elbo = elbo_value
