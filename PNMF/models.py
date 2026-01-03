@@ -1,113 +1,158 @@
 """
-Core PNMF implementation with sklearn-like API.
+Core PNMF implementation with variational inference and sklearn-like API.
+
+This module implements Probabilistic Non-negative Matrix Factorization using
+variational inference with Gaussian priors, following the GPzoo pattern.
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.distributions import Poisson
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 
 from .custom_modules import PositiveParameter
+from .priors import GaussianPrior
 
 
-class PNMFModel(nn.Module):
+def _poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
     """
-    Internal PyTorch model for Probabilistic NMF.
+    Compute Poisson log-likelihood.
 
-    This model uses Poisson factorization with projected gradient optimization
-    to ensure non-negativity constraints on the factor matrices.
+    log p(X|rate) = sum(X * log(rate) - rate)
+
+    Note: We omit the log(X!) term as it's constant w.r.t. parameters.
 
     Args:
-        n_features: Number of features (rows of input matrix)
-        n_components: Number of latent components
-        n_samples: Number of samples (columns of input matrix)
-        init_mode: Initialization mode ('softplus', 'exp', or 'projected')
+        X: Input data tensor (any shape)
+        rate: Rate parameter tensor (same shape as X)
+
+    Returns:
+        Log-likelihood value (scalar)
+    """
+    eps = 1e-8
+    rate = rate.clamp(min=eps)
+    log_lik = (X * torch.log(rate) - rate).sum()
+    return log_lik
+
+
+class PoissonFactorization(nn.Module):
+    """
+    Poisson Factorization base model with variational inference.
+
+    This model uses Poisson factorization with variational inference to learn
+    non-negative factor matrices. The latent factors F are sampled from a
+    Gaussian variational distribution, and the loadings W are positive parameters.
+
+    Args:
+        prior: A GaussianPrior object providing variational and prior distributions
+        y: Input data tensor of shape (D, N) where D is features, N is samples
+        L: Number of latent components (default: 10)
+        loadings_mode: Mode for enforcing positivity on W ('softplus', 'exp', or 'projected')
+
+    Attributes:
+        prior: GaussianPrior for variational inference
+        W: PositiveParameter loadings matrix of shape (D, L)
+        loadings_mode: Positivity constraint mode
+        D: Number of features
+        N: Number of samples
+        L: Number of latent components
+
+    Example:
+        >>> import torch
+        >>> from PNMF.priors import GaussianPrior
+        >>> from PNMF.models import PoissonFactorization
+        >>> y = torch.randn(100, 50)
+        >>> prior = GaussianPrior(y, L=10)
+        >>> model = PoissonFactorization(prior, y, L=10)
+        >>> rate, qF, pF = model(E=10)
     """
 
-    def __init__(self, n_features: int, n_components: int, n_samples: int, init_mode: str = 'softplus'):
+    def __init__(self, prior, y, L=10, loadings_mode='softplus'):
         super().__init__()
-        self.n_features = n_features
-        self.n_components = n_components
-        self.n_samples = n_samples
+        self.prior = prior
+        self.loadings_mode = loadings_mode
+        D, N = y.shape
+        self.D = D
+        self.N = N
+        self.L = L
 
-        # Basis matrix W (n_features x n_components) - positive parameters
-        self.W = PositiveParameter((n_features, n_components), mode=init_mode)
+        # Loadings matrix W (D x L) - positive parameters
+        self.W = PositiveParameter((D, L), mode=loadings_mode)
 
-        # Activation matrix H (n_components x n_samples)
-        self.H = PositiveParameter((n_components, n_samples), mode=init_mode)
+    def get_rate(self, prior_samples):
+        """
+        Compute the Poisson rate from prior samples.
 
-    def forward(self, E: int = 1) -> Tuple[torch.distributions.Distribution, torch.Tensor]:
+        Args:
+            prior_samples: Samples from the prior of shape (E, L, N)
+                          where E is number of samples, L is components, N is samples
+
+        Returns:
+            Z: Rate matrix of shape (E, D, N) where D is features
+        """
+        F = torch.exp(prior_samples)  # shape (E, L, N)
+        W = self.W.data  # shape (D, L)
+        # Z = W @ F gives (E, D, N)
+        Z = torch.matmul(F.transpose(1, 2), W.T).transpose(1, 2)
+        return Z
+
+    def forward(self, E=10):
         """
         Forward pass generating Poisson rate.
 
         Args:
-            E: Number of samples for Monte Carlo estimation
+            E: Number of Monte Carlo samples for variational inference
 
         Returns:
-            pY: Poisson distribution with rate W @ H
-            rate: The rate parameter (for direct access)
+            rate: Poisson rate tensor of shape (E, D, N)
+            qF: Variational posterior distribution
+            pF: Prior distribution
         """
-        # Get positive matrices
-        W_pos = self.W.data  # (n_features, n_components)
-        H_pos = self.H.data  # (n_components, n_samples)
-
-        # Compute rate: W @ H gives (n_features, n_samples)
-        rate = torch.matmul(W_pos, H_pos)
-
-        # Poisson distribution
-        pY = Poisson(rate=rate)
-
-        return pY, rate
-
-    def reconstruct(self) -> torch.Tensor:
-        """Return the reconstructed matrix."""
-        _, rate = self.forward(E=1)
-        return rate
+        qF, pF = self.prior()
+        F = qF.rsample((E,))  # Reparameterization trick, shape (E, L, N)
+        rate = self.get_rate(F)  # shape (E, D, N)
+        return rate, qF, pF
 
     def project_parameters(self):
         """Apply projection to ensure non-negativity (for projected gradient mode)."""
         self.W.project()
-        self.H.project()
 
 
 class PNMF:
     """
-    Probabilistic Non-negative Matrix Factorization.
+    Probabilistic Non-negative Matrix Factorization with variational inference.
 
-    This class provides a scikit-learn compatible interface for probabilistic
-    NMF using Poisson factorization with projected gradient optimization.
+    This class provides a scikit-learn compatible interface for variational
+    PNMF using Poisson factorization with ELBO optimization.
 
-    The model factorizes a non-negative matrix X into two non-negative matrices:
-        X ≈ W @ H
+    The model factorizes a non-negative matrix X into:
+        X ≈ W @ exp(F)
 
-    where W is the basis matrix and H is the coefficient matrix.
+    where W is the basis matrix (learned) and F is sampled from a
+    variational Gaussian distribution.
 
     Parameters
     ----------
-    n_components : int, default=2
+    n_components : int, default=10
         Number of latent components (rank of factorization).
 
-    init : {'random', 'custom'}, default='random'
-        Initialization method:
-        - 'random': Random initialization with positive values
-        - 'custom': Use custom provided W and H (must set W and H before fit)
-
-    init_mode : {'softplus', 'exp', 'projected'}, default='projected'
-        Method for enforcing non-negativity:
+    loadings_mode : {'softplus', 'exp', 'projected'}, default='projected'
+        Method for enforcing non-negativity on W:
         - 'softplus': Use softplus transformation
         - 'exp': Use exponential transformation
         - 'projected': Use projected gradient descent (clamp after each step)
+
+    E : int, default=10
+        Number of Monte Carlo samples for ELBO estimation.
 
     max_iter : int, default=200
         Maximum number of iterations.
 
     tol : float, default=1e-4
-        Tolerance for convergence. If the reconstruction error improvement is
-        less than tol, optimization stops.
+        Tolerance for convergence.
 
     learning_rate : float, default=0.01
-        Learning rate for gradient descent.
+        Learning rate for Adam optimizer.
 
     random_state : int, default=None
         Random seed for reproducibility.
@@ -129,8 +174,8 @@ class PNMF:
     n_features_in_ : int
         Number of features seen during fit.
 
-    reconstruction_err_ : float
-        Final reconstruction error.
+    elbo_ : float
+        Final ELBO value.
 
     n_iter_ : int
         Actual number of iterations performed.
@@ -148,9 +193,9 @@ class PNMF:
 
     def __init__(
         self,
-        n_components: int = 2,
-        init: str = 'random',
-        init_mode: str = 'projected',
+        n_components: int = 10,
+        loadings_mode: str = 'projected',
+        E: int = 3,
         max_iter: int = 200,
         tol: float = 1e-4,
         learning_rate: float = 0.01,
@@ -159,8 +204,8 @@ class PNMF:
         device: str = 'auto'
     ):
         self.n_components = n_components
-        self.init = init
-        self.init_mode = init_mode
+        self.loadings_mode = loadings_mode
+        self.E = E
         self.max_iter = max_iter
         self.tol = tol
         self.learning_rate = learning_rate
@@ -172,21 +217,18 @@ class PNMF:
         self.components_ = None
         self.n_components_ = n_components
         self.n_features_in_ = None
-        self.reconstruction_err_ = None
+        self.elbo_ = None
         self.n_iter_ = 0
         self._model = None
-        self._H = None
+        self._prior = None
 
     def _validate_params(self):
         """Validate input parameters."""
         if self.n_components < 1:
             raise ValueError("n_components must be >= 1")
 
-        if self.init not in ['random', 'custom']:
-            raise ValueError("init must be 'random' or 'custom'")
-
-        if self.init_mode not in ['softplus', 'exp', 'projected']:
-            raise ValueError("init_mode must be 'softplus', 'exp', or 'projected'")
+        if self.loadings_mode not in ['softplus', 'exp', 'projected']:
+            raise ValueError("loadings_mode must be 'softplus', 'exp', or 'projected'")
 
         if self.max_iter < 1:
             raise ValueError("max_iter must be >= 1")
@@ -197,68 +239,54 @@ class PNMF:
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be > 0")
 
+        if self.E < 1:
+            raise ValueError("E must be >= 1")
+
     def _get_device(self):
         """Determine the device to use."""
         if self.device == 'auto':
             return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         return torch.device(self.device)
 
-    def _initialize(
-        self,
-        X: np.ndarray,
-        W: Optional[np.ndarray] = None,
-        H: Optional[np.ndarray] = None
-    ) -> PNMFModel:
-        """Initialize the model."""
-        n_samples, n_features = X.shape
-
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-            np.random.seed(self.random_state)
-
-        model = PNMFModel(
-            n_features=n_features,
-            n_components=self.n_components,
-            n_samples=n_samples,
-            init_mode=self.init_mode
-        ).to(self._get_device())
-
-        if self.init == 'custom':
-            if W is not None and H is not None:
-                model.W.data = torch.from_numpy(W.astype(np.float32)).to(self._get_device())
-                model.H.data = torch.from_numpy(H.astype(np.float32)).to(self._get_device())
-            else:
-                raise ValueError("Custom init requires W and H to be provided")
-
-        return model
-
-    def _poisson_nll(self, X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
+    def _elbo(self, rate, qF, pF, X):
         """
-        Compute Poisson negative log-likelihood.
+        Compute the Evidence Lower BOund (ELBO).
+
+        ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
 
         Args:
-            X: Input data (n_samples, n_features)
-            rate: Predicted rate (n_samples, n_features)
+            rate: Poisson rate tensor of shape (E, D, N)
+            qF: Variational posterior distribution
+            pF: Prior distribution
+            X: Input data tensor of shape (D, N)
 
         Returns:
-            Negative log-likelihood
+            Negative ELBO (to minimize)
         """
-        # Poisson NLL: rate - X * log(rate) + log(X!)
-        # We omit log(X!) as it's constant w.r.t. parameters
-        eps = 1e-8
-        rate = rate.clamp(min=eps)
-        nll = rate - X * torch.log(rate)
-        return nll.sum()
+        # Expected log likelihood (Monte Carlo)
+        # rate has shape (E, D, N), X has shape (D, N)
+        E_samples = rate.shape[0]
+        X_expanded = X.unsqueeze(0).expand(E_samples, -1, -1)  # (E, D, N)
+
+        # Sum over all dimensions, then mean over E samples
+        log_lik = _poisson_log_likelihood(X_expanded, rate)
+
+        # KL divergence
+        kl = torch.distributions.kl_divergence(qF, pF).sum()
+
+        # Negative ELBO (for minimization)
+        # Note: We want to maximize ELBO, so minimize negative ELBO
+        # Since log_lik is already summed over E samples implicitly,
+        # we use: KL - E[log p(Y|F)]
+        return kl - log_lik / E_samples
 
     def fit(
         self,
         X: Union[np.ndarray, torch.Tensor],
-        y: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        W: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        H: Optional[Union[np.ndarray, torch.Tensor]] = None
+        y: Optional[Union[np.ndarray, torch.Tensor]] = None
     ) -> 'PNMF':
         """
-        Fit the PNMF model to data X.
+        Fit the PNMF model to data X using variational inference.
 
         Parameters
         ----------
@@ -268,18 +296,17 @@ class PNMF:
         y : Ignored
             Not used, present for scikit-learn compatibility.
 
-        W : array-like of shape (n_features, n_components), optional
-            Initial basis matrix for custom initialization.
-
-        H : array-like of shape (n_components, n_samples), optional
-            Initial coefficient matrix for custom initialization.
-
         Returns
         -------
         self : object
             Returns the instance itself.
         """
         self._validate_params()
+
+        # Set random seed
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
 
         # Convert input to torch tensor
         if isinstance(X, np.ndarray):
@@ -291,64 +318,61 @@ class PNMF:
         self.n_features_in_ = n_features
         self.n_components_ = self.n_components
 
-        # Convert to torch tensor
-        X_torch = torch.from_numpy(X_np.astype(np.float32)).to(self._get_device())
+        # Convert to torch tensor and transpose for model (D, N)
+        X_torch = torch.from_numpy(X_np.T.astype(np.float32)).to(self._get_device())
 
-        # Convert W and H if provided
-        W_torch = None
-        H_torch = None
-        if W is not None:
-            W_torch = torch.from_numpy(np.asarray(W).astype(np.float32)).to(self._get_device())
-        if H is not None:
-            H_torch = torch.from_numpy(np.asarray(H).astype(np.float32)).to(self._get_device())
+        # Initialize prior
+        self._prior = GaussianPrior(y=X_torch, L=self.n_components).to(self._get_device())
 
         # Initialize model
-        self._model = self._initialize(X_np, W=W_torch, H=H_torch)
+        self._model = PoissonFactorization(
+            prior=self._prior,
+            y=X_torch,
+            L=self.n_components,
+            loadings_mode=self.loadings_mode
+        ).to(self._get_device())
 
-        # Setup optimizer
-        params = list(self._model.W.parameters()) + list(self._model.H.parameters())
+        # Setup optimizer (W parameters + prior parameters)
+        params = list(self._model.W.parameters()) + list(self._prior.parameters())
         optimizer = torch.optim.Adam(params, lr=self.learning_rate)
 
         # Training loop
-        prev_loss = float('inf')
+        prev_elbo = float('-inf')
 
         for iteration in range(self.max_iter):
             optimizer.zero_grad()
 
             # Forward pass
-            _, rate = self._model.forward(E=1)
+            rate, qF, pF = self._model.forward(E=self.E)
 
-            # Compute loss (Poisson negative log-likelihood)
-            # Transpose rate to match X shape: rate is (n_features, n_samples), X is (n_samples, n_features)
-            rate_T = rate.t()
-            loss = self._poisson_nll(X_torch, rate_T)
+            # Compute ELBO loss
+            loss = self._elbo(rate, qF, pF, X_torch)
 
             # Backward pass
             loss.backward()
             optimizer.step()
 
             # Project parameters if using projected gradient
-            if self.init_mode == 'projected':
+            if self.loadings_mode == 'projected':
                 self._model.project_parameters()
 
             # Check convergence
-            loss_value = loss.item()
+            elbo_value = -loss.item()  # Convert back to ELBO
             if self.verbose and iteration % 10 == 0:
-                print(f"Iteration {iteration}: Loss = {loss_value:.6f}")
+                print(f"Iteration {iteration}: ELBO = {elbo_value:.6f}")
 
-            if abs(prev_loss - loss_value) < self.tol:
+            if abs(elbo_value - prev_elbo) < self.tol:
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
 
-            prev_loss = loss_value
+            prev_elbo = elbo_value
 
         self.n_iter_ = iteration + 1
-        self.reconstruction_err_ = prev_loss
+        self.elbo_ = prev_elbo
 
         # Store components (W transposed for sklearn compatibility: n_components x n_features)
         self.components_ = self._model.W.data.detach().cpu().numpy().T
-        self._H = self._model.H.data.detach().cpu().numpy()
 
         return self
 
@@ -356,8 +380,7 @@ class PNMF:
         """
         Transform X using the fitted model.
 
-        Given fixed W (components_), find the optimal H for new X.
-        This uses multiplicative update rules for non-negative least squares.
+        Given fixed W (components_), find the optimal F for new X.
 
         Parameters
         ----------
@@ -378,12 +401,11 @@ class PNMF:
         X_np = np.asarray(X).astype(np.float32)
         W = self.components_.T  # (n_features, n_components)
 
-        # Initialize H randomly
+        # For new data, use simple NNLS to find coefficients
         n_samples = X_np.shape[0]
         H = np.random.rand(n_samples, self.n_components_).astype(np.float32) * 0.1
 
         # Multiplicative update for H
-        # H <- H * (W^T @ X) / (W^T @ W @ H + eps)
         for _ in range(100):
             numerator = X_np @ W  # (n_samples, n_components)
             denominator = H @ (W.T @ W) + 1e-8  # (n_samples, n_components)
@@ -408,7 +430,7 @@ class PNMF:
             Transformed data.
         """
         self.fit(X, **kwargs)
-        return self._H.T  # (n_samples, n_components)
+        return self.transform(X)
 
     def inverse_transform(self, H: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """
