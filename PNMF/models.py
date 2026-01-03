@@ -8,7 +8,7 @@ import numpy as np
 from torch.distributions import Poisson
 from typing import Optional, Union, Tuple
 
-from ._utils import PositiveParameter
+from .custom_modules import PositiveParameter
 
 
 class PNMFModel(nn.Module):

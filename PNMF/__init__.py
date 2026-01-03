@@ -13,6 +13,6 @@ Example:
 
 __version__ = "0.1.0"
 
-from ._core import PNMF
+from .models import PNMF
 
 __all__ = ["PNMF"]
