@@ -82,24 +82,62 @@ Variational Inference
 ~~~~~~~~~~~~~~~~~~~~~
 
 We use **variational inference** to approximate the posterior distribution over the latent factors :math:`F`.
-The variational distribution :math:`q(F)` is a Gaussian with learnable mean and scale parameters.
+The variational distribution :math:`q(F)` is a Gaussian with learnable mean and scale parameters:
+
+.. math::
+
+   F_{i\ell} \sim q(F_{i\ell}) = \mathcal{N}(\mu_{i\ell}, \sigma_{i\ell}^2)
 
 The Evidence Lower BOund (ELBO) is:
 
 .. math::
 
-   \mathcal{L} = \mathbb{E}_{q(F)}[\log p(X|F)] - \text{KL}[q(F) \,||\, p(F)]
+   \mathcal{L} = \mathbb{E}_{q(F)}[\log p(Y|F)] - \text{KL}[q(F) \,||\, p(F)]
+
+Expected Log-Likelihood Expansion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The expected log-likelihood term expands as follows. For a Poisson observation model, the log-likelihood is:
+
+.. math::
+
+   \log p(Y_{ij} \mid \lambda_{ij}) = Y_{ij} \log \lambda_{ij} - \lambda_{ij} - \log (Y_{ij}!)
+
+Substituting the NSF parameterization :math:`\lambda_{ij} = \sum_{\ell} W_{j\ell} e^{F_{i\ell}}`, the expected log-likelihood becomes:
+
+.. math::
+
+   \mathbb{E}_{q(F_{i\cdot})}[\log p(Y_{ij} \mid F_{i\cdot})] =
+   Y_{ij} \, \mathbb{E}_{q(F_{i\cdot})}\!\left[ \log \sum_{\ell} W_{j\ell} e^{F_{i\ell}} \right]
+   - \sum_{\ell} W_{j\ell}\, \mathbb{E}_{q(F_{i\ell})}\!\left[ e^{F_{i\ell}} \right]
+   - \log(Y_{ij}!)
+
+The second expectation can be computed **analytically** using the moment-generating function of the Gaussian:
+
+.. math::
+
+   \mathbb{E}_{q(F_{i\ell})} \left[ e^{F_{i\ell}} \right]
+   = \exp\left( \mu_{i\ell} + \frac{1}{2} \sigma_{i\ell}^2 \right)
+
+This gives the final form:
+
+.. math::
+
+   \mathbb{E}_{q(F_{i \cdot})} [ \log p(Y_{ij} \mid F_{i \cdot}) ]
+   = Y_{ij} \, \underbrace{\mathbb{E}_{q(F_{i \cdot})} \left[ \log \sum_\ell W_{j\ell} e^{F_{i\ell}} \right]}_{\text{Monte Carlo}}
+   - \underbrace{\sum_\ell W_{j\ell} \, \exp\left( \mu_{i\ell} + \frac{1}{2} \sigma_{i\ell}^2 \right)}_{\text{Analytic}}
+   - \log (Y_{ij}!)
 
 where:
-
-- :math:`\mathbb{E}_{q(F)}[\log p(X|F)]` is the expected log-likelihood under the Poisson model
-- :math:`\text{KL}[q(F) \,||\, p(F)]` is the KL divergence between the variational and prior distributions
+- The first term (log of sum) is estimated via Monte Carlo sampling with the reparameterization trick
+- The second term (sum of exponentials) is computed analytically
+- The third term is constant with respect to the parameters
 
 Optimization
 ~~~~~~~~~~~~
 
-The model is optimized by maximizing the ELBO using gradient ascent with the reparameterization trick.
-The gradient is estimated using Monte Carlo sampling with :math:`E` samples.
+The model is optimized by maximizing the ELBO using gradient ascent. The variational parameters
+:math:`\mu_{i\ell}` and :math:`\sigma_{i\ell}` and the loadings :math:`W_{j\ell}` are learned jointly.
 
 .. toctree::
    :maxdepth: 2

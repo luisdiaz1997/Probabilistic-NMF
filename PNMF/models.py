@@ -249,35 +249,59 @@ class PNMF:
 
     def _elbo(self, rate, qF, pF, X):
         """
-        Compute the Evidence Lower BOund (ELBO).
+        Compute the Evidence Lower BOund (ELBO) using the expanded expectation form.
+
+        The expected log-likelihood is computed as:
+            E[log p(Y|F)] = Y * E[log(sum(W * exp(F)))] - sum(W * E[exp(F)])
+
+        where:
+        - The first term uses Monte Carlo estimation (requires log of sum)
+        - The second term is computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
 
         ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
 
         Args:
             rate: Poisson rate tensor of shape (E, D, N)
-            qF: Variational posterior distribution
+            qF: Variational posterior distribution with mean and scale
             pF: Prior distribution
             X: Input data tensor of shape (D, N)
 
         Returns:
             Negative ELBO (to minimize)
         """
-        # Expected log likelihood (Monte Carlo)
-        # rate has shape (E, D, N), X has shape (D, N)
         E_samples = rate.shape[0]
+        D, N = X.shape
+
+        # --- First term: Y_ij * E_q[log sum_l W_jl * exp(F_il)] ---
+        # This requires Monte Carlo estimation
+        eps = 1e-8
+        rate_clamped = rate.clamp(min=eps)
         X_expanded = X.unsqueeze(0).expand(E_samples, -1, -1)  # (E, D, N)
 
-        # Sum over all dimensions, then mean over E samples
-        log_lik = _poisson_log_likelihood(X_expanded, rate)
+        # E[Y * log(rate)] = (1/E) * sum_e Y * log(rate_e)
+        term1_mc = (X_expanded * torch.log(rate_clamped)).sum() / E_samples
+
+        # --- Second term: sum_l W_jl * E_q[exp(F_il)] ---
+        # Computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
+        # qF.mean has shape (L, N), qF.scale has shape (L, N)
+        mu = qF.mean  # (L, N)
+        sigma = qF.scale  # (L, N)
+
+        # E[exp(F_il)] = exp(mu_il + sigma_il^2 / 2)
+        exp_expectation = torch.exp(mu + 0.5 * sigma ** 2)  # (L, N)
+
+        # W has shape (D, L), need to compute: sum_j sum_l W_jl * exp_expectation[l, n]
+        W = self._model.W.data  # (D, L)
+        term2_analytic = torch.matmul(W, exp_expectation).sum()  # scalar
+
+        # Expected log likelihood (excluding constant -log(Y!) term)
+        log_lik = term1_mc - term2_analytic
 
         # KL divergence
         kl = torch.distributions.kl_divergence(qF, pF).sum()
 
         # Negative ELBO (for minimization)
-        # Note: We want to maximize ELBO, so minimize negative ELBO
-        # Since log_lik is already summed over E samples implicitly,
-        # we use: KL - E[log p(Y|F)]
-        return kl - log_lik / E_samples
+        return kl - log_lik
 
     def fit(
         self,
