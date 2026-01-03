@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnmf"
+version = "0.1.0"
+description = "Probabilistic Non-negative Matrix Factorization with Projected Gradients"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "GPL-2.0-only"}
+authors = [
+    {name = "Luis Chumpitaz Diaz", email = "luisdiaz1997@example.com"},
+]
+keywords = ["nmf", "non-negative matrix factorization", "probabilistic", "machine learning", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "isort>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/luisdiaz1997/Probabilistic-NMF"
+Repository = "https://github.com/luisdiaz1997/Probabilistic-NMF"
+Issues = "https://github.com/luisdiaz1997/Probabilistic-NMF/issues"
+
+[tool.setuptools]
+packages = ["PNMF"]
+
+[tool.setuptools.package-data]
+PNMF = ["*.py"]
