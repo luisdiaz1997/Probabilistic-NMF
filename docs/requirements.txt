@@ -1,0 +1,6 @@
+sphinx>=7.0
+sphinx-rtd-theme>=3.0
+sphinx-autodoc-typehints>=2.0
+numpy
+torch
+scikit-learn

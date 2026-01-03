@@ -379,7 +379,7 @@ class PNMF:
         """
         Transform X using the fitted model.
 
-        Given fixed W (components_), find the optimal F for new X.
+        Given fixed W (stored in components\\_), find the optimal F for new X.
 
         Parameters
         ----------
