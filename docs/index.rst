@@ -55,16 +55,28 @@ Mathematical Formulation
 Model
 ~~~~~
 
-The PNMF model factorizes a non-negative matrix :math:`X \in \mathbb{R}_{+}^{N \times D}` as:
+Given a non-negative data matrix :math:`Y \in \mathbb{R}_{+}^{N \times D}`, the PNMF model assumes each entry follows a Poisson distribution:
 
 .. math::
 
-   X \approx W @ \exp(F)
+   y_{ij} \sim \text{Poisson}(\lambda_{ij})
 
-where:
+where the rate parameter :math:`\lambda_{ij}` is given by:
+
+.. math::
+
+   \lambda_{ij} = \sum_{\ell=1}^{L} W_{j\ell} \exp(F_{i\ell})
+
+with the following components:
 
 - :math:`W \in \mathbb{R}_{+}^{D \times L}` are the loadings (learned parameters)
-- :math:`F \in \mathbb{R}^{L \times N}` are the latent factors (random variables)
+- :math:`F \in \mathbb{R}^{N \times L}` are the latent factors (random variables)
+
+The latent factors follow a Gaussian prior:
+
+.. math::
+
+   F_{i\ell} \sim \mathcal{N}(0, \sigma^2)
 
 Variational Inference
 ~~~~~~~~~~~~~~~~~~~~~
