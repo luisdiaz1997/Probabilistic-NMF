@@ -34,6 +34,16 @@ H = model.components_       # Components: (5, 50)
 X_reconstructed = model.inverse_transform(W)
 ```
 
+## Model
+
+PNMF uses a Poisson likelihood for the observed data:
+
+- y<sub>ij</sub> ~ Poisson(λ<sub>ij</sub>)
+- λ<sub>ij</sub> = Σ<sub>l</sub> W<sub>jl</sub> exp(F<sub>il</sub>)
+- F<sub>il</sub> ~ N(0, σ²)
+
+where **W** ≥ 0 are the loadings and **F** are the latent factors (variational inference with Gaussian prior).
+
 ## Features
 
 - **Probabilistic NMF**: Uses Poisson factorization for count data
