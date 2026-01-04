@@ -21,7 +21,7 @@ The following Jupyter notebook compares the two ELBO computation modes available
 Convergence Comparison
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The following plot shows the convergence behavior of both modes over 2000 iterations.
+The following plot shows the convergence behavior of both modes over 8000 iterations.
 The left panel shows the **loss** (negative ELBO) on a log scale, and the right panel
 shows the distance to convergence.
 
@@ -29,15 +29,24 @@ shows the distance to convergence.
    :align: center
    :width: 100%
 
-**Key Observations:**
+**Benchmark Parameters:**
 
-* Both modes achieve similar final ELBO values (-51111 simple vs -49931 expanded)
-* The difference (1180) is small, indicating both estimators converge to nearly the same solution
-* The loss curves on a log scale clearly show the optimization trajectory
-* Using E=3 Monte Carlo samples (default) provides good gradient estimates
-* Adam optimizer with lr=0.01 works well for this problem (SGD diverges)
-* Data is generated as integer counts via Poisson sampling, appropriate for the model
-* Full reproducibility: np.random.seed(42) + torch.manual_seed(42)
+* **Monte Carlo samples (E)**: 10 (reduced variance in gradient estimates)
+* **Learning rate**: 0.005 (conservative for stable convergence)
+* **Optimizer**: Adam
+* **Max iterations**: 8000 (tolerance: 1e-4)
+* **Data**: 200 samples × 100 features, 5 true components
+* **Data generation**: Poisson sampling for integer counts (appropriate for model)
+* **Device**: MPS (Apple Silicon) with automatic detection (CUDA > MPS > CPU)
+* **Random seed**: 42 for full reproducibility
+
+**Key Results:**
+
+* **Convergence speed**: Expanded mode converges ~1.08x faster (7022 vs 7592 iterations)
+* **Final ELBO values**: -47322.6055 (simple) vs -47198.6055 (expanded)
+* **ELBO difference**: 124.0 (small, indicating both estimators converge to nearly the same solution)
+* **Reconstruction error**: 0.241737 (simple) vs 0.241310 (expanded) - nearly identical
+* **Winner**: Expanded mode (faster convergence + higher final ELBO + lower reconstruction error)
 
 .. raw:: html
 
