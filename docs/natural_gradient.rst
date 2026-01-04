@@ -40,9 +40,11 @@ we can parameterize it in two ways:
       \theta_2 &= -\frac{1}{2\sigma^2}
 
 **Expectation parameterization:**
+
    .. math::
-      \eta_1 = \mathbb{E}[F] = \mu \\
-      \eta_2 = \mathbb{E}[F^2] = \sigma^2 + \mu^2
+
+      \eta_1 &= \mathbb{E}[F] = \mu \\
+      \eta_2 &= \mathbb{E}[F^2] = \sigma^2 + \mu^2
 
 Natural Gradient Computation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -105,7 +107,7 @@ The following plots compare standard vs natural gradient training across all thr
 
 .. image:: ../benchmarks/natural_gradient_comparison.png
    :align: center
-   **width: 100%
+   :width: 100%
 
 *Top row*: Loss convergence (log-log scale) for each mode
 *Bottom row*: Distance to convergence (log-log scale)
