@@ -55,8 +55,9 @@ For Gaussian marginals, this becomes:
    \leq \log \sum_\ell W_{j\ell} \exp\left(\mu_{i\ell} + \frac{1}{2}\sigma_{i\ell}^2\right)
 
 The **lower bound** (left inequality) gives us a fully analytic approximation that requires
-no Monte Carlo sampling, while the **upper bound** (right inequality) is used in the
-expanded mode's analytic computation of the second term.
+no Monte Carlo sampling (used in ``mode='lower-bound'``). The **upper bound** (right inequality)
+provides a valid upper bound, but is not directly used in any mode. Instead, the expanded mode
+uses Monte Carlo sampling for the log term and exact analytic computation for the rate term.
 
 Convergence Comparison
 ~~~~~~~~~~~~~~~~~~~~~~
