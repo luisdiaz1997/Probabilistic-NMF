@@ -13,91 +13,8 @@ from typing import Optional, Union
 from tqdm.auto import tqdm
 
 from .custom_modules import PositiveParameter
+from .optimizers import NaturalGradientDescent
 from .priors import GaussianPrior
-
-
-class NaturalGradientDescent(torch.optim.Optimizer):
-    """
-    Natural Gradient Descent (NGD) optimizer for variational parameters.
-
-    This optimizer implements natural gradient descent using the natural
-    parameterization for Gaussian variational distributions. The natural
-    gradients are computed via the Fisher information matrix.
-
-    For a Gaussian with natural parameters (θ₁, θ₂), the natural gradient
-    update is:
-        θ₁ ← θ₁ - ρ * ∂L/∂η₁
-        θ₂ ← θ₂ - ρ * ∂L/∂η₂
-
-    where η₁ = μ and η₂ = s² + μ² are the expectation parameters.
-
-    Args:
-        params: Iterable of parameters to optimize (natural parameters)
-        num_data: Number of data points N (for scaling the learning rate)
-        lr: Learning rate (default: 0.1)
-        jitter: Small value for numerical stability (default: 1e-8)
-
-    Example:
-        >>> # Natural parameters for Gaussian variational distribution
-        >>> theta1 = nn.Parameter(torch.zeros(10, 50))
-        >>> theta2 = nn.Parameter(-0.5 * torch.ones(10, 50))
-        >>> optimizer = NaturalGradientDescent(
-        ...     [theta1, theta2], num_data=100, lr=0.1
-        ... )
-        >>> optimizer.zero_grad()
-        >>> loss.backward()
-        >>> optimizer.step()
-    """
-
-    def __init__(self, params, num_data, lr=0.1, jitter=1e-8):
-        if num_data <= 0:
-            raise ValueError(f"num_data must be positive, got {num_data}")
-        if lr <= 0:
-            raise ValueError(f"Learning rate must be positive, got {lr}")
-
-        defaults = dict(lr=lr, num_data=num_data, jitter=jitter)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Perform a single optimization step.
-
-        Args:
-            closure: Optional closure for re-evaluating the loss
-
-        Returns:
-            The loss value if closure is provided, else None
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-            lr = group['lr']
-            num_data = group['num_data']
-            jitter = group['jitter']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                # Natural gradient update: θ ← θ - (ρ/N) * ∂L/∂η
-                # The gradient p.grad already contains ∂L/∂η from the backward pass
-                # due to the NaturalToMuS autograd function
-                state = self.state[p]
-
-                # Lazy state initialization
-                if len(state) == 0:
-                    state['step'] = 0
-
-                state['step'] += 1
-
-                # Natural gradient update with data scaling
-                # The learning rate is scaled by 1/num_data as per natural gradient theory
-                p.add_(p.grad, alpha=-lr / num_data)
-
-        return loss
 
 
 def _poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
@@ -626,9 +543,10 @@ class PNMF:
         if self.training_mode == 'natural':
             # Natural gradient mode: dual optimizers
             # NGD for variational parameters (natural params)
+            # Use smaller learning rate for NGD (0.1x) for stability
             nat_params = self._prior.natural_parameters()
             self._optimizer = NaturalGradientDescent(
-                nat_params, num_data=n_samples, lr=0.1
+                nat_params, num_data=n_samples, lr=self.learning_rate * 0.1
             )
 
             # Regular optimizer for W parameters

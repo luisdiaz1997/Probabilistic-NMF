@@ -146,6 +146,7 @@ The model is optimized by maximizing the ELBO using gradient ascent. The variati
    api
    examples
    benchmarks
+   natural_gradient
 
 
 
