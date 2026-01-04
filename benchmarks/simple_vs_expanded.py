@@ -75,7 +75,7 @@ def run_benchmark(mode='expanded', n_components=5, max_iter=100, random_state=42
         n_components=n_components,
         mode=mode,
         loadings_mode='projected',
-        E=3,
+        E=10,
         max_iter=max_iter,
         tol=1e-4,
         learning_rate=learning_rate,
@@ -121,13 +121,15 @@ def plot_results(results_simple, results_expanded, output_path='benchmarks/conve
     loss_simple = [-x for x in results_simple['elbo_history']]
     loss_expanded = [-x for x in results_expanded['elbo_history']]
 
-    # Plot 1: Loss convergence (log scale)
+    # Plot 1: Loss convergence (log-log scale)
     ax1 = axes[0]
-    ax1.semilogy(loss_simple, label='Simple (torch.Poisson)', linewidth=2)
-    ax1.semilogy(loss_expanded, label='Expanded (hybrid)', linewidth=2)
+    iterations_simple = range(1, len(loss_simple) + 1)
+    iterations_expanded = range(1, len(loss_expanded) + 1)
+    ax1.loglog(iterations_simple, loss_simple, label='Simple (torch.Poisson)', linewidth=2, alpha=0.7)
+    ax1.loglog(iterations_expanded, loss_expanded, label='Expanded (hybrid)', linewidth=2, alpha=0.7)
     ax1.set_xlabel('Iteration', fontsize=12)
     ax1.set_ylabel('Loss (-ELBO)', fontsize=12)
-    ax1.set_title('Loss Convergence (log scale)', fontsize=14)
+    ax1.set_title('Loss Convergence (log-log scale)', fontsize=14)
     ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
 
@@ -140,11 +142,11 @@ def plot_results(results_simple, results_expanded, output_path='benchmarks/conve
     diff_simple = [abs(x - final_simple) for x in loss_simple]
     diff_expanded = [abs(x - final_expanded) for x in loss_expanded]
 
-    ax2.semilogy(diff_simple, label='Simple (torch.Poisson)', linewidth=2)
-    ax2.semilogy(diff_expanded, label='Expanded (hybrid)', linewidth=2)
+    ax2.loglog(iterations_simple, diff_simple, label='Simple (torch.Poisson)', linewidth=2, alpha=0.7)
+    ax2.loglog(iterations_expanded, diff_expanded, label='Expanded (hybrid)', linewidth=2, alpha=0.7)
     ax2.set_xlabel('Iteration', fontsize=12)
     ax2.set_ylabel('|Loss - Final|', fontsize=12)
-    ax2.set_title('Distance to Convergence (log scale)', fontsize=14)
+    ax2.set_title('Distance to Convergence (log-log scale)', fontsize=14)
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
 
@@ -222,12 +224,12 @@ def main():
 
     # Run benchmarks
     print("Running simple mode (torch.Poisson)...")
-    results_simple = run_benchmark(mode='simple', n_components=5, max_iter=2000, random_state=42, verbose=False, optimizer='Adam')
+    results_simple = run_benchmark(mode='simple', n_components=5, max_iter=8000, random_state=42, verbose=False, optimizer='Adam', learning_rate=0.005)
     print(f"  Completed in {results_simple['n_iterations']} iterations")
     print()
 
     print("Running expanded mode (hybrid MC + analytic)...")
-    results_expanded = run_benchmark(mode='expanded', n_components=5, max_iter=2000, random_state=42, verbose=False, optimizer='Adam')
+    results_expanded = run_benchmark(mode='expanded', n_components=5, max_iter=8000, random_state=42, verbose=False, optimizer='Adam', learning_rate=0.005)
     print(f"  Completed in {results_expanded['n_iterations']} iterations")
     print()
 

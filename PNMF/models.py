@@ -173,8 +173,9 @@ class PNMF:
     verbose : bool, default=False
         Whether to print progress messages.
 
-    device : {'cpu', 'cuda', 'auto'}, default='auto'
-        Device to use for computation.
+    device : {'cpu', 'cuda', 'mps', 'auto'}, default='auto'
+        Device to use for computation. 'auto' will select mps (Apple Silicon),
+        cuda (NVIDIA), or cpu in that order based on availability.
 
     Attributes
     ----------
@@ -269,7 +270,12 @@ class PNMF:
     def _get_device(self):
         """Determine the device to use."""
         if self.device == 'auto':
-            return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            if torch.cuda.is_available():
+                return torch.device('cuda')
+            elif torch.backends.mps.is_available():
+                return torch.device('mps')
+            else:
+                return torch.device('cpu')
         return torch.device(self.device)
 
     def _elbo(self, rate, qF, pF, X):
