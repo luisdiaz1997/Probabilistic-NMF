@@ -162,7 +162,10 @@ class PNMF:
         Tolerance for convergence.
 
     learning_rate : float, default=0.01
-        Learning rate for Adam optimizer.
+        Learning rate for the optimizer.
+
+    optimizer : {'Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop'}, default='Adam'
+        Optimizer to use for training.
 
     random_state : int, default=None
         Random seed for reproducibility.
@@ -210,6 +213,7 @@ class PNMF:
         max_iter: int = 200,
         tol: float = 1e-4,
         learning_rate: float = 0.01,
+        optimizer: str = 'Adam',
         random_state: Optional[int] = None,
         verbose: bool = False,
         device: str = 'auto'
@@ -221,6 +225,7 @@ class PNMF:
         self.max_iter = max_iter
         self.tol = tol
         self.learning_rate = learning_rate
+        self.optimizer = optimizer
         self.random_state = random_state
         self.verbose = verbose
         self.device = device
@@ -233,6 +238,7 @@ class PNMF:
         self.n_iter_ = 0
         self._model = None
         self._prior = None
+        self._optimizer = None
 
     def _validate_params(self):
         """Validate input parameters."""
@@ -256,6 +262,9 @@ class PNMF:
 
         if self.E < 1:
             raise ValueError("E must be >= 1")
+
+        if self.optimizer not in ['Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop']:
+            raise ValueError("optimizer must be 'Adam', 'AdamW', 'NAdam', 'SGD', or 'RMSprop'")
 
     def _get_device(self):
         """Determine the device to use."""
@@ -394,8 +403,9 @@ class PNMF:
     def fit(
         self,
         X: Union[np.ndarray, torch.Tensor],
-        y: Optional[Union[np.ndarray, torch.Tensor]] = None
-    ) -> 'PNMF':
+        y: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        return_history: bool = False
+    ) -> Union['PNMF', tuple[list[float], 'PNMF']]:
         """
         Fit the PNMF model to data X using variational inference.
 
@@ -407,10 +417,14 @@ class PNMF:
         y : Ignored
             Not used, present for scikit-learn compatibility.
 
+        return_history : bool, default=False
+            If True, returns a tuple (history, self) where history is a list
+            of ELBO values during training.
+
         Returns
         -------
         self : object
-            Returns the instance itself.
+            Returns the instance itself (or (history, self) if return_history=True).
         """
         self._validate_params()
 
@@ -446,16 +460,26 @@ class PNMF:
 
         # Setup optimizer (W parameters + prior parameters)
         params = list(self._model.W.parameters()) + list(self._prior.parameters())
-        optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+        if self.optimizer == 'Adam':
+            self._optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+        elif self.optimizer == 'AdamW':
+            self._optimizer = torch.optim.AdamW(params, lr=self.learning_rate)
+        elif self.optimizer == 'NAdam':
+            self._optimizer = torch.optim.NAdam(params, lr=self.learning_rate)
+        elif self.optimizer == 'SGD':
+            self._optimizer = torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9)
+        elif self.optimizer == 'RMSprop':
+            self._optimizer = torch.optim.RMSprop(params, lr=self.learning_rate)
 
         # Training loop
         prev_elbo = float('-inf')
+        elbo_history = [] if return_history else None
 
         # Create progress bar
         pbar = tqdm(range(self.max_iter), disable=self.verbose, desc=f"PNMF fitting ({self.mode} mode)")
 
         for iteration in pbar:
-            optimizer.zero_grad()
+            self._optimizer.zero_grad()
 
             # Forward pass
             rate, qF, pF = self._model.forward(E=self.E)
@@ -465,7 +489,7 @@ class PNMF:
 
             # Backward pass
             loss.backward()
-            optimizer.step()
+            self._optimizer.step()
 
             # Project parameters if using projected gradient
             if self.loadings_mode == 'projected':
@@ -473,6 +497,10 @@ class PNMF:
 
             # Check convergence
             elbo_value = -loss.item()  # Convert back to ELBO
+
+            # Track ELBO history
+            if return_history:
+                elbo_history.append(elbo_value)
 
             if self.verbose:
                 # Use print statements for verbose mode
@@ -498,6 +526,8 @@ class PNMF:
         # Store components (W transposed for sklearn compatibility: n_components x n_features)
         self.components_ = self._model.W.data.detach().cpu().numpy().T
 
+        if return_history:
+            return elbo_history, self
         return self
 
     def transform(self, X: Union[np.ndarray, torch.Tensor]) -> np.ndarray:

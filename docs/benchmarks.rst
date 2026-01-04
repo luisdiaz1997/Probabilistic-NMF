@@ -11,10 +11,6 @@ Simple vs Expanded ELBO Modes
 
 The following Jupyter notebook compares the two ELBO computation modes available in PNMF:
 
-.. raw:: html
-
-    <div style="margin-bottom: 20px;"></div>
-
 **`mode='simple'`**
    Uses full Monte Carlo estimation for all terms in the Poisson log-likelihood.
 
@@ -22,7 +18,30 @@ The following Jupyter notebook compares the two ELBO computation modes available
    Uses a hybrid approach with Monte Carlo estimation for the first term and
    analytic computation for the second term using the Gaussian moment-generating function.
 
-.. nbsphinx:: ../benchmarks/simple_vs_expanded.ipynb
+Convergence Comparison
+~~~~~~~~~~~~~~~~~~~~~~
+
+The following plot shows the convergence behavior of both modes over 2000 iterations.
+The left panel shows the **loss** (negative ELBO) on a log scale, and the right panel
+shows the distance to convergence.
+
+.. image:: ../benchmarks/convergence_comparison.png
+   :align: center
+   :width: 100%
+
+**Key Observations:**
+
+* Both modes achieve similar final ELBO values (-51111 simple vs -49931 expanded)
+* The difference (1180) is small, indicating both estimators converge to nearly the same solution
+* The loss curves on a log scale clearly show the optimization trajectory
+* Using E=3 Monte Carlo samples (default) provides good gradient estimates
+* Adam optimizer with lr=0.01 works well for this problem (SGD diverges)
+* Data is generated as integer counts via Poisson sampling, appropriate for the model
+* Full reproducibility: np.random.seed(42) + torch.manual_seed(42)
+
+.. raw:: html
+
+    <div style="margin-bottom: 20px;"></div>
 
 Key Takeaways
 -------------

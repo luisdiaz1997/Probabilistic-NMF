@@ -62,7 +62,9 @@ class GaussianPrior(nn.Module):
             pF: Prior distribution Normal(0, scale_pf)
         """
         # PositiveParameter.data already applies softplus transformation
-        qF = distributions.Normal(self.mean, self.scale.data)
+        # Add small epsilon to ensure scale > 0 (Normal distribution requires strictly positive)
+        scale_constrained = self.scale.data.clamp(min=1e-8)
+        qF = distributions.Normal(self.mean, scale_constrained)
         pF = distributions.Normal(
             torch.zeros_like(qF.mean),
             self.scale_pf * torch.ones_like(qF.scale)
@@ -81,7 +83,7 @@ class GaussianPrior(nn.Module):
             pF: Prior distribution for the batch
         """
         # Index into PositiveParameter - .data applies softplus
-        scale_batched = self.scale.data[:, idx]
+        scale_batched = self.scale.data[:, idx].clamp(min=1e-8)
         qF = distributions.Normal(self.mean[:, idx], scale_batched)
         pF = distributions.Normal(
             torch.zeros_like(qF.mean),
