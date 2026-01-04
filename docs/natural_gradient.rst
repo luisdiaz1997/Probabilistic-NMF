@@ -35,7 +35,9 @@ we can parameterize it in two ways:
       \theta = (\mu, \sigma)
 
    The natural parameters are:
+
    .. math::
+
       \theta_1 &= \frac{\mu}{\sigma^2} \\
       \theta_2 &= -\frac{1}{2\sigma^2}
 
