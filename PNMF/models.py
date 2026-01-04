@@ -16,6 +16,90 @@ from .custom_modules import PositiveParameter
 from .priors import GaussianPrior
 
 
+class NaturalGradientDescent(torch.optim.Optimizer):
+    """
+    Natural Gradient Descent (NGD) optimizer for variational parameters.
+
+    This optimizer implements natural gradient descent using the natural
+    parameterization for Gaussian variational distributions. The natural
+    gradients are computed via the Fisher information matrix.
+
+    For a Gaussian with natural parameters (θ₁, θ₂), the natural gradient
+    update is:
+        θ₁ ← θ₁ - ρ * ∂L/∂η₁
+        θ₂ ← θ₂ - ρ * ∂L/∂η₂
+
+    where η₁ = μ and η₂ = s² + μ² are the expectation parameters.
+
+    Args:
+        params: Iterable of parameters to optimize (natural parameters)
+        num_data: Number of data points N (for scaling the learning rate)
+        lr: Learning rate (default: 0.1)
+        jitter: Small value for numerical stability (default: 1e-8)
+
+    Example:
+        >>> # Natural parameters for Gaussian variational distribution
+        >>> theta1 = nn.Parameter(torch.zeros(10, 50))
+        >>> theta2 = nn.Parameter(-0.5 * torch.ones(10, 50))
+        >>> optimizer = NaturalGradientDescent(
+        ...     [theta1, theta2], num_data=100, lr=0.1
+        ... )
+        >>> optimizer.zero_grad()
+        >>> loss.backward()
+        >>> optimizer.step()
+    """
+
+    def __init__(self, params, num_data, lr=0.1, jitter=1e-8):
+        if num_data <= 0:
+            raise ValueError(f"num_data must be positive, got {num_data}")
+        if lr <= 0:
+            raise ValueError(f"Learning rate must be positive, got {lr}")
+
+        defaults = dict(lr=lr, num_data=num_data, jitter=jitter)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """
+        Perform a single optimization step.
+
+        Args:
+            closure: Optional closure for re-evaluating the loss
+
+        Returns:
+            The loss value if closure is provided, else None
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            num_data = group['num_data']
+            jitter = group['jitter']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                # Natural gradient update: θ ← θ - (ρ/N) * ∂L/∂η
+                # The gradient p.grad already contains ∂L/∂η from the backward pass
+                # due to the NaturalToMuS autograd function
+                state = self.state[p]
+
+                # Lazy state initialization
+                if len(state) == 0:
+                    state['step'] = 0
+
+                state['step'] += 1
+
+                # Natural gradient update with data scaling
+                # The learning rate is scaled by 1/num_data as per natural gradient theory
+                p.add_(p.grad, alpha=-lr / num_data)
+
+        return loss
+
+
 def _poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
     """
     Compute Poisson log-likelihood.
@@ -154,6 +238,11 @@ class PNMF:
         - 'expanded': Use hybrid Monte Carlo + analytic expectation (default)
         - 'lower-bound': Use Jensen's lower bound (fully analytic, no MC sampling)
 
+    training_mode : {'standard', 'natural'}, default='standard'
+        Training mode for variational parameters:
+        - 'standard': Standard gradient descent with Adam/other optimizer
+        - 'natural': Natural gradient descent with dual optimizers (NGD for variational, Adam for W)
+
     E : int, default=10
         Number of Monte Carlo samples for ELBO estimation.
 
@@ -167,7 +256,7 @@ class PNMF:
         Learning rate for the optimizer.
 
     optimizer : {'Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop'}, default='Adam'
-        Optimizer to use for training.
+        Optimizer to use for training (applies to W parameters in natural mode).
 
     random_state : int, default=None
         Random seed for reproducibility.
@@ -212,6 +301,7 @@ class PNMF:
         n_components: int = 10,
         loadings_mode: str = 'projected',
         mode: str = 'expanded',
+        training_mode: str = 'standard',
         E: int = 3,
         max_iter: int = 200,
         tol: float = 1e-4,
@@ -224,6 +314,7 @@ class PNMF:
         self.n_components = n_components
         self.loadings_mode = loadings_mode
         self.mode = mode
+        self.training_mode = training_mode
         self.E = E
         self.max_iter = max_iter
         self.tol = tol
@@ -242,6 +333,7 @@ class PNMF:
         self._model = None
         self._prior = None
         self._optimizer = None
+        self._w_optimizer = None
 
     def _validate_params(self):
         """Validate input parameters."""
@@ -253,6 +345,9 @@ class PNMF:
 
         if self.mode not in ['simple', 'expanded', 'lower-bound']:
             raise ValueError("mode must be 'simple', 'expanded', or 'lower-bound'")
+
+        if self.training_mode not in ['standard', 'natural']:
+            raise ValueError("training_mode must be 'standard' or 'natural'")
 
         if self.max_iter < 1:
             raise ValueError("max_iter must be >= 1")
@@ -510,8 +605,13 @@ class PNMF:
         # Convert to torch tensor and transpose for model (D, N)
         X_torch = torch.from_numpy(X_np.T.astype(np.float32)).to(self._get_device())
 
-        # Initialize prior
-        self._prior = GaussianPrior(y=X_torch, L=self.n_components).to(self._get_device())
+        # Initialize prior with natural gradient mode if specified
+        use_natural_gradients = (self.training_mode == 'natural')
+        self._prior = GaussianPrior(
+            y=X_torch,
+            L=self.n_components,
+            use_natural_gradients=use_natural_gradients
+        ).to(self._get_device())
 
         # Initialize model
         self._model = PoissonFactorization(
@@ -522,28 +622,55 @@ class PNMF:
             mode=self.mode
         ).to(self._get_device())
 
-        # Setup optimizer (W parameters + prior parameters)
-        params = list(self._model.W.parameters()) + list(self._prior.parameters())
-        if self.optimizer == 'Adam':
-            self._optimizer = torch.optim.Adam(params, lr=self.learning_rate)
-        elif self.optimizer == 'AdamW':
-            self._optimizer = torch.optim.AdamW(params, lr=self.learning_rate)
-        elif self.optimizer == 'NAdam':
-            self._optimizer = torch.optim.NAdam(params, lr=self.learning_rate)
-        elif self.optimizer == 'SGD':
-            self._optimizer = torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9)
-        elif self.optimizer == 'RMSprop':
-            self._optimizer = torch.optim.RMSprop(params, lr=self.learning_rate)
+        # Setup optimizers based on training mode
+        if self.training_mode == 'natural':
+            # Natural gradient mode: dual optimizers
+            # NGD for variational parameters (natural params)
+            nat_params = self._prior.natural_parameters()
+            self._optimizer = NaturalGradientDescent(
+                nat_params, num_data=n_samples, lr=0.1
+            )
+
+            # Regular optimizer for W parameters
+            W_params = list(self._model.W.parameters())
+            if self.optimizer == 'Adam':
+                self._w_optimizer = torch.optim.Adam(W_params, lr=self.learning_rate)
+            elif self.optimizer == 'AdamW':
+                self._w_optimizer = torch.optim.AdamW(W_params, lr=self.learning_rate)
+            elif self.optimizer == 'NAdam':
+                self._w_optimizer = torch.optim.NAdam(W_params, lr=self.learning_rate)
+            elif self.optimizer == 'SGD':
+                self._w_optimizer = torch.optim.SGD(W_params, lr=self.learning_rate, momentum=0.9)
+            elif self.optimizer == 'RMSprop':
+                self._w_optimizer = torch.optim.RMSprop(W_params, lr=self.learning_rate)
+        else:
+            # Standard mode: single optimizer for all parameters
+            params = list(self._model.W.parameters()) + list(self._prior.parameters())
+            if self.optimizer == 'Adam':
+                self._optimizer = torch.optim.Adam(params, lr=self.learning_rate)
+            elif self.optimizer == 'AdamW':
+                self._optimizer = torch.optim.AdamW(params, lr=self.learning_rate)
+            elif self.optimizer == 'NAdam':
+                self._optimizer = torch.optim.NAdam(params, lr=self.learning_rate)
+            elif self.optimizer == 'SGD':
+                self._optimizer = torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9)
+            elif self.optimizer == 'RMSprop':
+                self._optimizer = torch.optim.RMSprop(params, lr=self.learning_rate)
+            self._w_optimizer = None
 
         # Training loop
         prev_elbo = float('-inf')
         elbo_history = [] if return_history else None
 
-        # Create progress bar
-        pbar = tqdm(range(self.max_iter), disable=self.verbose, desc=f"PNMF fitting ({self.mode} mode)")
+        # Update progress bar description based on training mode
+        mode_desc = f"{self.mode} mode, {self.training_mode} training"
+        pbar = tqdm(range(self.max_iter), disable=self.verbose, desc=f"PNMF fitting ({mode_desc})")
 
         for iteration in pbar:
+            # Zero gradients for all optimizers
             self._optimizer.zero_grad()
+            if self._w_optimizer is not None:
+                self._w_optimizer.zero_grad()
 
             # Forward pass
             rate, qF, pF = self._model.forward(E=self.E)
@@ -553,7 +680,15 @@ class PNMF:
 
             # Backward pass
             loss.backward()
-            self._optimizer.step()
+
+            # Step optimizers
+            if self.training_mode == 'natural':
+                # Natural gradient mode: step both optimizers
+                self._optimizer.step()  # NGD for variational parameters
+                self._w_optimizer.step()  # Adam for W parameters
+            else:
+                # Standard mode: single optimizer
+                self._optimizer.step()
 
             # Project parameters if using projected gradient
             if self.loadings_mode == 'projected':

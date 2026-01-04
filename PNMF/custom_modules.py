@@ -11,6 +11,91 @@ from abc import abstractmethod
 from typing import Union, Tuple
 
 
+class NaturalToMuS(torch.autograd.Function):
+    """
+    Custom autograd function for converting natural parameters to (μ, s).
+
+    Natural parameterization for Gaussian variational distribution:
+        θ₁ = μ/s²  (natural parameter for mean)
+        θ₂ = -1/(2s²)  (natural parameter for precision)
+
+    Forward pass: converts (θ₁, θ₂) → (μ, s)
+    Backward pass: returns gradients w.r.t. expectation parameters (η₁, η₂)
+                   where η₁ = μ and η₂ = s² + μ²
+
+    This enables natural gradient descent for variational inference.
+
+    Example:
+        >>> theta1 = torch.randn(10, 50, requires_grad=True)
+        >>> theta2 = -0.5 * torch.ones(10, 50, requires_grad=True)
+        >>> mu, s = NaturalToMuS.apply(theta1, theta2)
+    """
+
+    @staticmethod
+    def forward(ctx, theta1, theta2, jitter=1e-6):
+        """
+        Convert natural parameters to (μ, s).
+
+        Natural parameters:
+            θ₁ = μ/s²
+            θ₂ = -1/(2s²)
+
+        Args:
+            ctx: Context object for backward pass
+            theta1: Natural parameter θ₁ of shape (L, N)
+            theta2: Natural parameter θ₂ of shape (L, N)
+            jitter: Small value for numerical stability
+
+        Returns:
+            mu: Mean parameter of shape (L, N)
+            s: Standard deviation of shape (L, N)
+        """
+        # s² = -1/(2θ₂)
+        s_squared = -1.0 / (2.0 * theta2 + jitter)
+        s = torch.sqrt(s_squared.clamp(min=jitter))
+
+        # μ = s² * θ₁
+        mu = s_squared * theta1
+
+        ctx.save_for_backward(mu, s)
+        return mu, s
+
+    @staticmethod
+    def backward(ctx, dout_dmu, dout_ds):
+        """
+        Compute gradients w.r.t. expectation parameters (η₁, η₂).
+
+        The natural gradients are computed as:
+            ∂L/∂η₁ = ∂L/∂μ - 2μ·∂L/∂(s²)
+            ∂L/∂η₂ = ∂L/∂(s²)
+
+        where ∂L/∂(s²) = (∂L/∂s) * (∂s/∂s²) = (∂L/∂s) / (2s)
+
+        Args:
+            ctx: Context object with saved tensors
+            dout_dmu: Gradient of loss w.r.t. μ
+            dout_ds: Gradient of loss w.r.t. s
+
+        Returns:
+            dout_deta1: Gradient w.r.t. η₁
+            dout_deta2: Gradient w.r.t. η₂
+            None: For jitter argument
+        """
+        mu, s = ctx.saved_tensors
+
+        # Convert gradient w.r.t. s to gradient w.r.t. s²
+        # ∂s/∂s² = 1/(2s)
+        dout_ds_squared = dout_ds / (2.0 * s + 1e-8)
+
+        # Natural gradients (gradients w.r.t. expectation params)
+        # η₁ = μ
+        # η₂ = s² + μ²
+        dout_deta1 = dout_dmu - 2.0 * mu * dout_ds_squared
+        dout_deta2 = dout_ds_squared
+
+        return dout_deta1, dout_deta2, None
+
+
 class ConstrainedParameter(nn.Module):
     """
     Base class for parameters with constraints.
