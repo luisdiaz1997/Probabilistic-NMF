@@ -1,9 +1,10 @@
 """
-Benchmark: Simple vs Expanded ELBO Modes
+Benchmark: ELBO Mode Comparison
 
-This script compares the two ELBO computation modes:
-- 'simple': Uses torch.distributions.Poisson.log_prob() directly
-- 'expanded': Uses hybrid Monte Carlo + analytic expectation
+This script compares three ELBO computation modes:
+- 'simple': Uses torch.distributions.Poisson.log_prob() directly (full Monte Carlo)
+- 'expanded': Uses hybrid Monte Carlo + analytic expectation (default)
+- 'lower-bound': Uses Jensen's lower bound (fully analytic, no MC sampling)
 
 The benchmark measures:
 1. Convergence speed (iterations to convergence)
@@ -56,7 +57,7 @@ def run_benchmark(mode='expanded', n_components=5, max_iter=100, random_state=42
     Run PNMF with specified mode and track convergence.
 
     Args:
-        mode: 'simple' or 'expanded'
+        mode: 'simple', 'expanded', or 'lower-bound'
         n_components: Number of components
         max_iter: Maximum iterations
         random_state: Random seed
@@ -106,13 +107,14 @@ def run_benchmark(mode='expanded', n_components=5, max_iter=100, random_state=42
     }
 
 
-def plot_results(results_simple, results_expanded, output_path='benchmarks/convergence_comparison.png'):
+def plot_results(results_simple, results_expanded, results_lower_bound, output_path='benchmarks/convergence_comparison.png'):
     """
-    Plot convergence comparison between simple and expanded modes.
+    Plot convergence comparison between all three modes.
 
     Args:
         results_simple: Results from simple mode
         results_expanded: Results from expanded mode
+        results_lower_bound: Results from lower-bound mode
         output_path: Path to save the plot
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -120,13 +122,16 @@ def plot_results(results_simple, results_expanded, output_path='benchmarks/conve
     # Convert ELBO to loss (negative ELBO)
     loss_simple = [-x for x in results_simple['elbo_history']]
     loss_expanded = [-x for x in results_expanded['elbo_history']]
+    loss_lb = [-x for x in results_lower_bound['elbo_history']]
 
     # Plot 1: Loss convergence (log-log scale)
     ax1 = axes[0]
     iterations_simple = range(1, len(loss_simple) + 1)
     iterations_expanded = range(1, len(loss_expanded) + 1)
-    ax1.loglog(iterations_simple, loss_simple, label='Simple (torch.Poisson)', linewidth=2, alpha=0.7)
-    ax1.loglog(iterations_expanded, loss_expanded, label='Expanded (hybrid)', linewidth=2, alpha=0.7)
+    iterations_lb = range(1, len(loss_lb) + 1)
+    ax1.loglog(iterations_simple, loss_simple, label='Simple (MC)', linewidth=2, alpha=0.7)
+    ax1.loglog(iterations_expanded, loss_expanded, label='Expanded (Hybrid)', linewidth=2, alpha=0.7)
+    ax1.loglog(iterations_lb, loss_lb, label='Lower Bound (Analytic)', linewidth=2, alpha=0.7)
     ax1.set_xlabel('Iteration', fontsize=12)
     ax1.set_ylabel('Loss (-ELBO)', fontsize=12)
     ax1.set_title('Loss Convergence (log-log scale)', fontsize=14)
@@ -137,13 +142,16 @@ def plot_results(results_simple, results_expanded, output_path='benchmarks/conve
     ax2 = axes[1]
     final_simple = loss_simple[-1]
     final_expanded = loss_expanded[-1]
+    final_lb = loss_lb[-1]
 
     # Plot distance to convergence
     diff_simple = [abs(x - final_simple) for x in loss_simple]
     diff_expanded = [abs(x - final_expanded) for x in loss_expanded]
+    diff_lb = [abs(x - final_lb) for x in loss_lb]
 
-    ax2.loglog(iterations_simple, diff_simple, label='Simple (torch.Poisson)', linewidth=2, alpha=0.7)
-    ax2.loglog(iterations_expanded, diff_expanded, label='Expanded (hybrid)', linewidth=2, alpha=0.7)
+    ax2.loglog(iterations_simple, diff_simple, label='Simple (MC)', linewidth=2, alpha=0.7)
+    ax2.loglog(iterations_expanded, diff_expanded, label='Expanded (Hybrid)', linewidth=2, alpha=0.7)
+    ax2.loglog(iterations_lb, diff_lb, label='Lower Bound (Analytic)', linewidth=2, alpha=0.7)
     ax2.set_xlabel('Iteration', fontsize=12)
     ax2.set_ylabel('|Loss - Final|', fontsize=12)
     ax2.set_title('Distance to Convergence (log-log scale)', fontsize=14)
@@ -155,75 +163,75 @@ def plot_results(results_simple, results_expanded, output_path='benchmarks/conve
     print(f"Plot saved to {output_path}")
 
 
-def print_summary(results_simple, results_expanded):
+def print_summary(results_simple, results_expanded, results_lower_bound):
     """
     Print a summary of the benchmark results.
 
     Args:
         results_simple: Results from simple mode
         results_expanded: Results from expanded mode
+        results_lower_bound: Results from lower-bound mode
     """
-    print("=" * 70)
-    print("PNMF Benchmark: Simple vs Expanded ELBO Modes")
-    print("=" * 70)
+    print("=" * 80)
+    print("PNMF Benchmark: ELBO Mode Comparison")
+    print("=" * 80)
     print()
 
-    print(f"{'Metric':<30} {'Simple':<20} {'Expanded':<20}")
-    print("-" * 70)
+    print(f"{'Metric':<35} {'Simple':<18} {'Expanded':<18} {'Lower Bound':<18}")
+    print("-" * 80)
 
     # Iterations to convergence
-    print(f"{'Iterations to convergence':<30} "
-          f"{results_simple['n_iterations']:<20} "
-          f"{results_expanded['n_iterations']:<20}")
+    print(f"{'Iterations to convergence':<35} "
+          f"{results_simple['n_iterations']:<18} "
+          f"{results_expanded['n_iterations']:<18} "
+          f"{results_lower_bound['n_iterations']:<18}")
 
     # Final ELBO
-    print(f"{'Final ELBO':<30} "
-          f"{results_simple['final_elbo']:<20.4f} "
-          f"{results_expanded['final_elbo']:<20.4f}")
-
-    # ELBO difference
-    elbo_diff = abs(results_simple['final_elbo'] - results_expanded['final_elbo'])
-    print(f"{'ELBO difference':<30} {'':<20} {elbo_diff:<20.6f}")
+    print(f"{'Final ELBO':<35} "
+          f"{results_simple['final_elbo']:<18.4f} "
+          f"{results_expanded['final_elbo']:<18.4f} "
+          f"{results_lower_bound['final_elbo']:<18.4f}")
 
     # Reconstruction error
-    print(f"{'Relative reconstruction error':<30} "
-          f"{results_simple['reconstruction_error']:<20.6f} "
-          f"{results_expanded['reconstruction_error']:<20.6f}")
+    print(f"{'Relative reconstruction error':<35} "
+          f"{results_simple['reconstruction_error']:<18.6f} "
+          f"{results_expanded['reconstruction_error']:<18.6f} "
+          f"{results_lower_bound['reconstruction_error']:<18.6f}")
 
     print()
 
-    # Winner analysis
-    if results_simple['n_iterations'] < results_expanded['n_iterations']:
-        faster = "Simple"
-        speedup = results_expanded['n_iterations'] / results_simple['n_iterations']
-    else:
-        faster = "Expanded"
-        speedup = results_simple['n_iterations'] / results_expanded['n_iterations']
+    # Winner analysis for convergence
+    iterations = [results_simple['n_iterations'], results_expanded['n_iterations'], results_lower_bound['n_iterations']]
+    modes = ['Simple', 'Expanded', 'Lower Bound']
+    min_idx = np.argmin(iterations)
+    fastest = modes[min_idx]
+    speedup_vs_simple = iterations[0] / iterations[2]
+    speedup_vs_expanded = iterations[1] / iterations[2]
 
-    print(f"Convergence winner: {faster} ({speedup:.2f}x faster)")
+    print(f"Convergence winner: {fastest}")
+    print(f"  - Lower bound is {speedup_vs_simple:.2f}x faster than simple")
+    print(f"  - Lower bound is {speedup_vs_expanded:.2f}x faster than expanded")
     print()
 
     # ELBO comparison
-    if results_simple['final_elbo'] > results_expanded['final_elbo']:
-        print(f"Final ELBO winner: Simple (higher by {elbo_diff:.6f})")
-    elif results_expanded['final_elbo'] > results_simple['final_elbo']:
-        print(f"Final ELBO winner: Expanded (higher by {elbo_diff:.6f})")
-    else:
-        print("Final ELBO: Tie")
+    elbos = [results_simple['final_elbo'], results_expanded['final_elbo'], results_lower_bound['final_elbo']]
+    max_idx = np.argmax(elbos)
+    best_elbo_mode = modes[max_idx]
+    print(f"Final ELBO winner: {best_elbo_mode} (highest)")
 
-    print("=" * 70)
+    print("=" * 80)
 
 
 def main():
     """Main benchmark function."""
-    print("Running PNMF benchmark: Simple vs Expanded ELBO modes...")
+    print("Running PNMF benchmark: ELBO mode comparison...")
     print()
 
     # Set random seed for reproducibility
     np.random.seed(42)
 
     # Run benchmarks
-    print("Running simple mode (torch.Poisson)...")
+    print("Running simple mode (full Monte Carlo)...")
     results_simple = run_benchmark(mode='simple', n_components=5, max_iter=8000, random_state=42, verbose=False, optimizer='Adam', learning_rate=0.005)
     print(f"  Completed in {results_simple['n_iterations']} iterations")
     print()
@@ -233,13 +241,18 @@ def main():
     print(f"  Completed in {results_expanded['n_iterations']} iterations")
     print()
 
+    print("Running lower-bound mode (Jensen bound, fully analytic)...")
+    results_lower_bound = run_benchmark(mode='lower-bound', n_components=5, max_iter=8000, random_state=42, verbose=False, optimizer='Adam', learning_rate=0.005)
+    print(f"  Completed in {results_lower_bound['n_iterations']} iterations")
+    print()
+
     # Print summary
-    print_summary(results_simple, results_expanded)
+    print_summary(results_simple, results_expanded, results_lower_bound)
 
     # Plot results
     print()
     print("Generating plots...")
-    plot_results(results_simple, results_expanded)
+    plot_results(results_simple, results_expanded, results_lower_bound)
 
     print()
     print("Benchmark complete!")
