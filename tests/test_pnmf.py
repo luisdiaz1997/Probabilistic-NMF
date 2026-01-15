@@ -10,7 +10,7 @@ import torch
 import pytest
 
 from PNMF import PNMF, PoissonFactorization, GaussianPrior
-from PNMF import compute_elbo, compute_expected_log_lik, compute_kl_divergence
+from PNMF import compute_elbo, expected_log_likelihood, kl_divergence
 
 
 # =============================================================================
@@ -190,35 +190,35 @@ class TestELBOFunctions:
         self.rate, self.qF, self.pF = self.model(E=self.E)
         self.W = self.model.W.data
 
-    def test_compute_expected_log_lik_simple(self):
+    def test_expected_log_likelihood_simple(self):
         """Test simple expected log-likelihood computation."""
-        from PNMF.elbo import compute_expected_log_lik_simple
+        from PNMF.elbo import expected_log_likelihood_simple
 
-        result = compute_expected_log_lik_simple(self.rate, self.X_torch)
-        assert torch.isfinite(result), "Expected log-lik should be finite"
-        assert result < 0, "Expected log-lik should be negative"
+        result = expected_log_likelihood_simple(self.rate, self.X_torch)
+        assert torch.isfinite(result), "Expected log-likelihood should be finite"
+        assert result < 0, "Expected log-likelihood should be negative"
 
-    def test_compute_expected_log_lik_expanded(self):
+    def test_expected_log_likelihood_expanded(self):
         """Test expanded expected log-likelihood computation."""
-        from PNMF.elbo import compute_expected_log_lik_expanded
+        from PNMF.elbo import expected_log_likelihood_expanded
 
-        result = compute_expected_log_lik_expanded(
+        result = expected_log_likelihood_expanded(
             self.rate, self.qF, self.X_torch, self.W
         )
-        assert torch.isfinite(result), "Expected log-lik should be finite"
-        assert result < 0, "Expected log-lik should be negative"
+        assert torch.isfinite(result), "Expected log-likelihood should be finite"
+        assert result < 0, "Expected log-likelihood should be negative"
 
-    def test_compute_expected_log_lik_lower_bound(self):
+    def test_expected_log_likelihood_lower_bound(self):
         """Test lower-bound expected log-likelihood computation."""
-        from PNMF.elbo import compute_expected_log_lik_lower_bound
+        from PNMF.elbo import expected_log_likelihood_lower_bound
 
-        result = compute_expected_log_lik_lower_bound(self.qF, self.X_torch, self.W)
-        assert torch.isfinite(result), "Expected log-lik should be finite"
-        assert result < 0, "Expected log-lik should be negative"
+        result = expected_log_likelihood_lower_bound(self.qF, self.X_torch, self.W)
+        assert torch.isfinite(result), "Expected log-likelihood should be finite"
+        assert result < 0, "Expected log-likelihood should be negative"
 
-    def test_compute_kl_divergence(self):
+    def test_kl_divergence(self):
         """Test KL divergence computation."""
-        kl = compute_kl_divergence(self.qF, self.pF)
+        kl = kl_divergence(self.qF, self.pF)
         assert torch.isfinite(kl), "KL should be finite"
         assert kl >= 0, "KL divergence should be non-negative"
 

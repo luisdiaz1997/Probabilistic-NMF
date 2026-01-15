@@ -35,8 +35,8 @@ def poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
     """
     eps = 1e-8
     rate = rate.clamp(min=eps)
-    log_lik = (X * torch.log(rate) - rate).sum()
-    return log_lik
+    log_likelihood = (X * torch.log(rate) - rate).sum()
+    return log_likelihood
 
 
 # =============================================================================
@@ -44,7 +44,7 @@ def poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 
 
-def compute_expected_log_lik_simple(rate, X):
+def expected_log_likelihood_simple(rate, X):
     """
     Compute expected log-likelihood using full Monte Carlo estimation.
 
@@ -68,15 +68,15 @@ def compute_expected_log_lik_simple(rate, X):
 
     # Use torch.distributions.Poisson for clean, numerically stable computation
     poisson_dist = torch.distributions.Poisson(rate=rate)
-    log_lik_mc = poisson_dist.log_prob(X_expanded)
+    log_likelihood_mc = poisson_dist.log_prob(X_expanded)
 
     # Expected log likelihood via Monte Carlo: (1/E) * sum_e log p(Y|F_e)
-    expected_log_lik = log_lik_mc.sum() / E_samples
+    expected_log_likelihood = log_likelihood_mc.sum() / E_samples
 
-    return expected_log_lik
+    return expected_log_likelihood
 
 
-def compute_expected_log_lik_expanded(rate, qF, X, W):
+def expected_log_likelihood_expanded(rate, qF, X, W):
     """
     Compute expected log-likelihood using the expanded expectation form.
 
@@ -122,12 +122,12 @@ def compute_expected_log_lik_expanded(rate, qF, X, W):
 
     # Expected log likelihood (including the Poisson normalization -log(Y!) term)
     # Using lgamma(X+1) = log(X!) for the Poisson PMF normalization
-    expected_log_lik = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
+    expected_log_likelihood = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
 
-    return expected_log_lik
+    return expected_log_likelihood
 
 
-def compute_expected_log_lik_lower_bound(qF, X, W):
+def expected_log_likelihood_lower_bound(qF, X, W):
     """
     Compute expected log-likelihood using Jensen's lower bound (fully analytic).
 
@@ -174,12 +174,12 @@ def compute_expected_log_lik_lower_bound(qF, X, W):
 
     # Expected log likelihood (including Poisson normalization)
     # Note: Since we use a lower bound on the log term, this is a true lower bound
-    expected_log_lik = term1_lower - term2_analytic - torch.lgamma(X + 1).sum()
+    expected_log_likelihood = term1_lower - term2_analytic - torch.lgamma(X + 1).sum()
 
-    return expected_log_lik
+    return expected_log_likelihood
 
 
-def compute_expected_log_lik(mode, rate, qF, X, W):
+def expected_log_likelihood(mode, rate, qF, X, W):
     """
     Compute expected log-likelihood E[log p(Y|F)].
 
@@ -199,11 +199,11 @@ def compute_expected_log_lik(mode, rate, qF, X, W):
         Expected log-likelihood E[log p(Y|F)] (scalar)
     """
     if mode == 'simple':
-        return compute_expected_log_lik_simple(rate, X)
+        return expected_log_likelihood_simple(rate, X)
     elif mode == 'lower-bound':
-        return compute_expected_log_lik_lower_bound(qF, X, W)
+        return expected_log_likelihood_lower_bound(qF, X, W)
     else:  # 'expanded'
-        return compute_expected_log_lik_expanded(rate, qF, X, W)
+        return expected_log_likelihood_expanded(rate, qF, X, W)
 
 
 # =============================================================================
@@ -211,7 +211,7 @@ def compute_expected_log_lik(mode, rate, qF, X, W):
 # =============================================================================
 
 
-def compute_kl_divergence(qF, pF):
+def kl_divergence(qF, pF):
     """
     Compute KL divergence between variational posterior and prior.
 
@@ -255,13 +255,13 @@ def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None):
         Negative ELBO (to minimize)
     """
     # Compute expected log-likelihood using the specified mode
-    expected_log_lik = compute_expected_log_lik(mode, rate, qF, X, W)
+    exp_log_likelihood = expected_log_likelihood(mode, rate, qF, X, W)
 
     # Compute KL divergence (use custom function if provided)
     if kl_fn is not None:
         kl = kl_fn(qF, pF)
     else:
-        kl = compute_kl_divergence(qF, pF)
+        kl = kl_divergence(qF, pF)
 
     # Negative ELBO (for minimization)
-    return kl - expected_log_lik
+    return kl - exp_log_likelihood

@@ -415,11 +415,11 @@ Potential improvements:
 **What was changed:**
 - Refactored `PNMF/elbo.py` to separate expected log-likelihood (modes) from KL divergence
 - Renamed ELBO functions to expected log-likelihood functions:
-  - `compute_elbo_simple()` → `compute_expected_log_lik_simple()`
-  - `compute_elbo_expanded()` → `compute_expected_log_lik_expanded()`
-  - `compute_elbo_lower_bound()` → `compute_expected_log_lik_lower_bound()`
-- Added new dispatcher `compute_expected_log_lik()` for expected log-likelihood only
-- Added `compute_kl_divergence()` as a separate function
+  - `compute_elbo_simple()` → `expected_log_likelihood_simple()`
+  - `compute_elbo_expanded()` → `expected_log_likelihood_expanded()`
+  - `compute_elbo_lower_bound()` → `expected_log_likelihood_lower_bound()`
+- Added new dispatcher `expected_log_likelihood()` for expected log-likelihood only
+- Added `kl_divergence()` as a separate function
 - Updated `compute_elbo()` to accept optional `kl_fn` parameter for custom KL implementations
 - Exported new functions in `__init__.py`
 
@@ -437,15 +437,15 @@ Potential improvements:
 def poisson_log_likelihood(X, rate) -> Tensor
 
 # Expected log-likelihood functions (modes)
-def compute_expected_log_lik_simple(rate, X) -> Tensor
-def compute_expected_log_lik_expanded(rate, qF, X, W) -> Tensor
-def compute_expected_log_lik_lower_bound(qF, X, W) -> Tensor
-def compute_expected_log_lik(mode, rate, qF, X, W) -> Tensor  # dispatcher
+def expected_log_likelihood_simple(rate, X) -> Tensor
+def expected_log_likelihood_expanded(rate, qF, X, W) -> Tensor
+def expected_log_likelihood_lower_bound(qF, X, W) -> Tensor
+def expected_log_likelihood(mode, rate, qF, X, W) -> Tensor  # dispatcher
 
 # KL divergence
-def compute_kl_divergence(qF, pF) -> Tensor
+def kl_divergence(qF, pF) -> Tensor
 
-# Full ELBO (combines expected log-lik - KL)
+# Full ELBO (combines expected log-likelihood - KL)
 def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None) -> Tensor
 ```
 
