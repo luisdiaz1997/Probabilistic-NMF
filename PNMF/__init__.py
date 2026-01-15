@@ -7,8 +7,8 @@ compatible with scikit-learn's API.
 Example:
     >>> from PNMF import PNMF
     >>> model = PNMF(n_components=5, random_state=0)
-    >>> W = model.fit_transform(X)
-    >>> H = model.components_
+    >>> transformed = model.fit_transform(X)
+    >>> components = model.components_
 
 For PyTorch-native usage:
     >>> from PNMF import PoissonFactorization, GaussianPrior

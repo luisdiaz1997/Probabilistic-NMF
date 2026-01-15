@@ -42,11 +42,11 @@ Quick Start
 
    # Initialize and fit
    model = PNMF(n_components=5, random_state=42, verbose=True)
-   W = model.fit_transform(X)
+   transformed = model.fit_transform(X)
 
    # Access results
    print(f"Components shape: {model.components_.shape}")  # (5, 50)
-   print(f"Transformed shape: {W.shape}")                 # (100, 5)
+   print(f"Transformed shape: {transformed.shape}")                 # (100, 5)
    print(f"ELBO: {model.elbo_}")
 
 Mathematical Formulation

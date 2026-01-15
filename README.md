@@ -27,11 +27,11 @@ X = np.random.rand(100, 50)
 
 # Initialize and fit the model
 model = PNMF(n_components=5, init='random', random_state=42)
-W = model.fit_transform(X)  # Transformed data: (100, 5)
-H = model.components_       # Components: (5, 50)
+transformed = model.fit_transform(X)  # Transformed data: (100, 5)
+components = model.components_        # Components: (5, 50)
 
 # Reconstruct the data
-X_reconstructed = model.inverse_transform(W)
+X_reconstructed = model.inverse_transform(transformed)
 ```
 
 ## Model
@@ -73,7 +73,7 @@ Methods:
 - `fit(X, y=None, W=None, H=None)`: Fit the model to data X
 - `transform(X)`: Transform X using the fitted model
 - `fit_transform(X, **kwargs)`: Fit the model and transform X
-- `inverse_transform(H)`: Transform data back to original space
+- `inverse_transform(transformed)`: Transform data back to original space
 
 ## License
 

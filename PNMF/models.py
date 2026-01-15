@@ -133,10 +133,13 @@ class PNMF:
     PNMF using Poisson factorization with ELBO optimization.
 
     The model factorizes a non-negative matrix X into:
-        X ≈ W @ exp(F)
+        X ≈ exp(F) @ W.T
 
-    where W is the basis matrix (learned) and F is sampled from a
-    variational Gaussian distribution.
+    where F is the latent factor matrix (sample-specific, sampled from a
+    variational Gaussian distribution) and W is the loading matrix (learned).
+
+    Note: For sklearn API compatibility, fit_transform returns exp(F) (called
+    the "transformed data") and components_ stores W.T (called the "components").
 
     Parameters
     ----------
@@ -208,9 +211,9 @@ class PNMF:
     >>> from PNMF import PNMF
     >>> X = np.random.rand(100, 50)  # 100 samples, 50 features
     >>> model = PNMF(n_components=5, random_state=42)
-    >>> W = model.fit_transform(X)  # W: (100, 5) transformed data
-    >>> H = model.components_  # H: (5, 50) components
-    >>> X_reconstructed = model.inverse_transform(W)
+    >>> transformed = model.fit_transform(X)  # exp(F): (100, 5) transformed data
+    >>> components = model.components_        # W.T: (5, 50) components
+    >>> X_reconstructed = model.inverse_transform(transformed)
     """
 
     def __init__(
@@ -651,7 +654,11 @@ class PNMF:
         """
         Transform X using the fitted model.
 
-        Given fixed W (stored in components\\_), find the optimal F for new X.
+        Given fixed W (stored in components\\_), find the optimal exp(F) for new X.
+
+        Note: This uses a simple NNLS (non-negative least squares) approach.
+        For sklearn NMF compatibility, the returned value represents exp(F) in
+        our model notation (called W in sklearn NMF's X ≈ W @ H.T notation).
 
         Parameters
         ----------
@@ -660,8 +667,9 @@ class PNMF:
 
         Returns
         -------
-        H : ndarray of shape (n_samples, n_components)
-            Transformed data (coefficient matrix).
+        transformed : ndarray of shape (n_samples, n_components)
+            Transformed data (exp(F) in our model notation, corresponding to
+            sklearn NMF's W coefficient matrix).
         """
         if self.components_ is None:
             raise ValueError("Model has not been fitted yet.")
@@ -697,20 +705,22 @@ class PNMF:
 
         Returns
         -------
-        H : ndarray of shape (n_samples, n_components)
-            Transformed data.
+        transformed : ndarray of shape (n_samples, n_components)
+            Transformed data (exp(F) in our model notation).
         """
         self.fit(X, **kwargs)
         return self.transform(X)
 
-    def inverse_transform(self, H: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    def inverse_transform(self, transformed: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """
         Transform data back to its original space.
 
+        Reconstructs X from exp(F) using: X ≈ exp(F) @ W.T
+
         Parameters
         ----------
-        H : array-like of shape (n_samples, n_components)
-            Transformed data in component space.
+        transformed : array-like of shape (n_samples, n_components)
+            Transformed data (exp(F) in our model notation).
 
         Returns
         -------
@@ -720,9 +730,9 @@ class PNMF:
         if self.components_ is None:
             raise ValueError("Model has not been fitted yet.")
 
-        if isinstance(H, torch.Tensor):
-            H = H.detach().cpu().numpy()
+        if isinstance(transformed, torch.Tensor):
+            transformed = transformed.detach().cpu().numpy()
 
-        H = np.asarray(H)
-        # X = H @ W^T = H @ components_
-        return H @ self.components_
+        transformed = np.asarray(transformed)
+        # X = exp(F) @ W.T = transformed @ components_
+        return transformed @ self.components_

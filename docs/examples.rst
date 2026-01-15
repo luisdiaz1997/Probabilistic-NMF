@@ -17,13 +17,13 @@ Basic Usage
    model = PNMF(n_components=5, random_state=42)
 
    # Fit the model
-   W = model.fit_transform(X)
+   transformed = model.fit_transform(X)
 
    # Access the learned components
-   H = model.components_
+   components = model.components_
 
-   print(f"Transformed data shape: {W.shape}")     # (100, 5)
-   print(f"Components shape: {H.shape}")           # (5, 50)
+   print(f"Transformed data shape: {transformed.shape}")     # (100, 5)
+   print(f"Components shape: {components.shape}")           # (5, 50)
    print(f"Final ELBO: {model.elbo_}")             # Evidence Lower Bound
    print(f"Iterations: {model.n_iter_}")           # Number of iterations
 

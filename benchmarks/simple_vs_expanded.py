@@ -23,7 +23,8 @@ def generate_synthetic_data(n_samples=200, n_features=100, n_components=5, rando
     Generate synthetic non-negative data for benchmarking.
 
     Creates data that approximately follows the PNMF model:
-    X ≈ W @ exp(F) where F ~ N(0, 1)
+    Internal: X (D, N) ≈ W (D, L) @ exp(F) (L, N)
+    sklearn API: X (N, D) ≈ exp(F).T (N, L) @ W.T (L, D)
     Uses Poisson sampling to generate integer counts.
 
     Args:
