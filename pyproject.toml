@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "torch>=1.9.0",
     "numpy>=1.19.0",
+    "tqdm>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -48,3 +49,10 @@ packages = ["PNMF"]
 
 [tool.setuptools.package-data]
 PNMF = ["*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v"

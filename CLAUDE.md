@@ -14,7 +14,12 @@ Probabilistic-NMF/
 │   ├── __init__.py          # Package initialization and exports
 │   ├── models.py            # PoissonFactorization (PyTorch) + PNMF (sklearn API)
 │   ├── priors.py            # GaussianPrior class for variational inference
+│   ├── elbo.py              # Expected log-likelihood and ELBO computation
+│   ├── optimizers.py        # Custom optimizers (NaturalGradientDescent)
 │   └── custom_modules.py    # Constrained parameter classes (ConstrainedParameter, PositiveParameter)
+├── tests/                   # Test suite
+│   ├── __init__.py
+│   └── test_pnmf.py         # Pytest tests for all components
 ├── benchmarks/              # Benchmark scripts and notebooks
 │   ├── README.md            # Benchmark documentation
 │   ├── simple_vs_expanded.py    # Standalone benchmark script
@@ -26,8 +31,8 @@ Probabilistic-NMF/
 │   ├── examples.rst         # Usage examples
 │   ├── benchmarks.rst       # Benchmark page with embedded notebook
 │   └── requirements.txt     # Documentation dependencies
-├── setup.py                 # Package setup configuration
-├── pyproject.toml           # Modern Python project metadata
+├── setup.py                 # Minimal setup for backwards compatibility
+├── pyproject.toml           # Package metadata and all dependencies
 ├── .readthedocs.yaml        # Read the Docs configuration
 ├── README.md                # Documentation
 ├── LICENSE                  # GPL v2.0 license
@@ -47,6 +52,7 @@ The following components were adapted from [GPzoo](https://github.com/luisdiaz19
 **From `gpzoo/gp.py`:**
 - `GaussianPrior` class - Variational distribution with mean/scale parameters
 - Returns (qF, pF) for ELBO computation
+- **NEW**: Now supports natural gradient parameterization (`use_natural_gradients=True`)
 
 **From `gpzoo/likelihoods.py`:**
 - `PoissonFactorization` base class - Variational Poisson factorization
@@ -61,11 +67,13 @@ The model uses **variational inference** with:
 
 **Model equation:**
 ```
-X ≈ W @ exp(F)
+X ≈ exp(F) @ W.T
 ```
 where:
-- W is learned via PositiveParameter (projected gradient by default)
-- F is sampled from Gaussian variational distribution (reparameterization trick)
+- F is the latent factor matrix (sample-specific, sampled from Gaussian variational distribution)
+- W is the loading matrix (learned via PositiveParameter, projected gradient by default)
+- For sklearn API: X (n_samples, n_features) ≈ exp(F) (n_samples, n_components) @ W.T (n_components, n_features)
+- Internal representation: X (D, N) ≈ W (D, L) @ exp(F) (L, N)
 
 ### 4. Key Features Implemented
 
@@ -78,8 +86,8 @@ import numpy as np
 model = PNMF(n_components=5, random_state=42)
 
 # Fit and transform
-W = model.fit_transform(X)    # Shape: (n_samples, n_components)
-H = model.components_         # Shape: (n_components, n_features)
+transformed = model.fit_transform(X)    # Shape: (n_samples, n_components) - exp(F)
+components = model.components_         # Shape: (n_components, n_features) - W.T
 
 # Access ELBO
 print(f"ELBO: {model.elbo_}")
@@ -100,6 +108,7 @@ rate, qF, pF = model(E=3)  # Returns rate tensor and distributions
 - `n_components`: 10
 - `loadings_mode`: `'projected'` (clamp after each step)
 - `mode`: `'expanded'` (hybrid Monte Carlo + analytic ELBO)
+- `training_mode`: `'standard'` (standard gradient descent)
 - `E`: 3 (Monte Carlo samples for ELBO)
 - `max_iter`: 200
 - `tol`: 1e-4
@@ -219,9 +228,22 @@ See the **ELBO Computation Modes** section above for details on how the expected
 
 ### Classes
 
+**NaturalToMuS** (`custom_modules.py`)
+- Custom autograd function for natural parameter conversion
+- Forward: (θ₁, θ₂) → (μ, s) where θ₁ = μ/s², θ₂ = -1/(2s²)
+- Backward: Returns gradients w.r.t. expectation parameters (η₁, η₂)
+- Enables natural gradient descent for variational inference
+
+**NaturalGradientDescent** (`models.py`)
+- Custom PyTorch optimizer implementing NGD for variational parameters
+- Uses learning rate scaled by `1/num_data` as per natural gradient theory
+- Default learning rate: `lr=0.1`
+
 **GaussianPrior** (`priors.py`)
-- Variational mean parameter (nn.Parameter)
-- Variational scale parameter (PositiveParameter with softplus)
+- Variational mean parameter (nn.Parameter) [standard mode]
+- Variational scale parameter (PositiveParameter with softplus) [standard mode]
+- Natural parameters (θ₁, θ₂) for NGD [natural mode]
+- `use_natural_gradients` parameter to switch between modes
 - Returns (qF, pF) distributions
 
 **PoissonFactorization** (`models.py`)
@@ -233,6 +255,7 @@ See the **ELBO Computation Modes** section above for details on how the expected
 - sklearn-compatible wrapper
 - Creates GaussianPrior internally
 - Uses ELBO loss instead of NLL
+- `training_mode` parameter: `'standard'` or `'natural'`
 
 ### PositiveParameter Class
 
@@ -253,16 +276,43 @@ X = np.random.rand(100, 50)
 
 # Initialize and fit
 model = PNMF(n_components=5, random_state=42, verbose=True)
-W = model.fit_transform(X)
+transformed = model.fit_transform(X)
 
 # Access results
 print(f"Components shape: {model.components_.shape}")  # (5, 50)
-print(f"Transformed shape: {W.shape}")                 # (100, 5)
+print(f"Transformed shape: {transformed.shape}")                 # (100, 5)
 print(f"ELBO: {model.elbo_}")
 print(f"Iterations: {model.n_iter_}")
 ```
 
-## Testing / Verification
+## Testing
+
+### Running Tests
+
+The package includes a comprehensive test suite using pytest:
+
+```bash
+# Run all tests
+python -m pytest tests/test_pnmf.py -v
+
+# Run specific test class
+python -m pytest tests/test_pnmf.py::TestELBOModes -v
+
+# Run with coverage (if pytest-cov installed)
+python -m pytest tests/test_pnmf.py --cov=PNMF
+```
+
+### Test Coverage
+
+The test suite covers:
+- **TestPNMFBasic**: sklearn API (fit, transform, fit_transform, inverse_transform)
+- **TestELBOModes**: All three ELBO modes (simple, expanded, lower-bound)
+- **TestTrainingModes**: Standard and natural gradient training
+- **TestELBOFunctions**: Direct testing of ELBO computation functions
+- **TestPyTorchAPI**: PyTorch-native API (PoissonFactorization, GaussianPrior)
+- **TestParameterValidation**: Input validation and error handling
+
+### Quick Verification
 
 Quick test to verify the implementation works:
 
@@ -270,16 +320,16 @@ Quick test to verify the implementation works:
 from PNMF import PNMF
 import numpy as np
 
-# Create sample data
+# Create integer count data (appropriate for Poisson model)
 np.random.seed(42)
-X = np.random.rand(50, 30) * 10  # 50 samples, 30 features
+X = np.random.poisson(lam=5, size=(50, 30)).astype(np.float32)
 
 # Initialize and fit
 model = PNMF(n_components=5, random_state=42, verbose=True, max_iter=20)
-W = model.fit_transform(X)
+transformed = model.fit_transform(X)
 
 print(f'Components shape: {model.components_.shape}')  # (5, 30)
-print(f'Transformed shape: {W.shape}')                 # (50, 5)
+print(f'Transformed shape: {transformed.shape}')       # (50, 5)
 print(f'ELBO: {model.elbo_:.4f}')
 print(f'Iterations: {model.n_iter_}')
 ```
@@ -359,6 +409,121 @@ Potential improvements:
 - Add benchmarking against sklearn NMF
 
 ## Recent Changes
+
+### 2025-01-14: Separate expected log-likelihood from KL divergence in elbo.py
+
+**What was changed:**
+- Refactored `PNMF/elbo.py` to separate expected log-likelihood (modes) from KL divergence
+- Renamed ELBO functions to expected log-likelihood functions:
+  - `compute_elbo_simple()` → `compute_expected_log_lik_simple()`
+  - `compute_elbo_expanded()` → `compute_expected_log_lik_expanded()`
+  - `compute_elbo_lower_bound()` → `compute_expected_log_lik_lower_bound()`
+- Added new dispatcher `compute_expected_log_lik()` for expected log-likelihood only
+- Added `compute_kl_divergence()` as a separate function
+- Updated `compute_elbo()` to accept optional `kl_fn` parameter for custom KL implementations
+- Exported new functions in `__init__.py`
+
+**Why it matters:**
+- **Custom KL divergence**: Can now pass a custom KL function to `compute_elbo()`
+- **Better modularity**: Expected log-likelihood and KL divergence are now independent
+- **Future extensibility**: Easier to add custom KL implementations (e.g., for different priors)
+- **Cleaner API**: Users can access individual components if needed
+
+**Module structure:**
+```python
+# PNMF/elbo.py
+
+# Helper
+def poisson_log_likelihood(X, rate) -> Tensor
+
+# Expected log-likelihood functions (modes)
+def compute_expected_log_lik_simple(rate, X) -> Tensor
+def compute_expected_log_lik_expanded(rate, qF, X, W) -> Tensor
+def compute_expected_log_lik_lower_bound(qF, X, W) -> Tensor
+def compute_expected_log_lik(mode, rate, qF, X, W) -> Tensor  # dispatcher
+
+# KL divergence
+def compute_kl_divergence(qF, pF) -> Tensor
+
+# Full ELBO (combines expected log-lik - KL)
+def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None) -> Tensor
+```
+
+**Usage with custom KL:**
+```python
+from PNMF import compute_elbo
+
+# Custom KL function
+def my_custom_kl(qF, pF):
+    # Custom implementation
+    return ...
+
+# Use custom KL in ELBO computation
+loss = compute_elbo(mode, rate, qF, pF, X, W, kl_fn=my_custom_kl)
+```
+
+### 2025-01-14: Refactor ELBO computation into separate module
+
+**What was changed:**
+- Created new `PNMF/elbo.py` module with all ELBO computation functions
+- Extracted from `models.py`:
+  - `poisson_log_likelihood()` - helper function
+  - `compute_elbo_simple()` - full Monte Carlo ELBO
+  - `compute_elbo_expanded()` - hybrid MC + analytic ELBO
+  - `compute_elbo_lower_bound()` - fully analytic Jensen's bound ELBO
+  - `compute_elbo()` - dispatcher function
+- Updated `models.py` to import and use the new `elbo.py` module
+- Removed ~180 lines of ELBO methods from `PNMF` class
+
+**Why it matters:**
+- **Better separation of concerns**: ELBO computation is now isolated from model architecture
+- **Cleaner codebase**: `models.py` focuses on model structure, `elbo.py` on loss computation
+- **Easier testing**: ELBO functions can be tested independently
+- **Reusability**: ELBO functions can be used outside the PNMF class if needed
+
+### 2025-01-03: Add Natural Gradient Training Mode (Commit `XXXXXXX`)
+
+**What was changed:**
+- Added `NaturalToMuS` autograd function to `custom_modules.py` for natural parameter conversion
+- Added `NaturalGradientDescent` optimizer class to `models.py` implementing NGD for variational parameters
+- Modified `GaussianPrior` class to support natural parameterization (`use_natural_gradients` parameter)
+- Added `training_mode` parameter to `PNMF` class (`'standard'` or `'natural'`)
+- Updated `fit()` method to use dual optimizers in natural mode:
+  - NGD for variational parameters (θ₁, θ₂)
+  - Adam/other for W parameters
+
+**Why it matters:**
+- **Better convergence**: Natural gradient mode achieves ~20% better ELBO than standard mode
+- **Faster optimization**: NGD uses the Fisher information matrix for more efficient parameter updates
+- **Theoretically sound**: Natural gradients follow the geometry of the variational distribution
+
+**Usage:**
+```python
+# Standard training mode (default)
+model_std = PNMF(n_components=5, training_mode='standard')
+
+# Natural gradient training mode
+model_nat = PNMF(n_components=5, training_mode='natural')
+```
+
+**Technical details:**
+- **Natural parameterization**: Gaussian variational distribution parameterized by (θ₁, θ₂) instead of (μ, s):
+  - θ₁ = μ/s² (natural parameter for mean)
+  - θ₂ = -1/(2s²) (natural parameter for precision)
+- **Natural gradient computation**: The `NaturalToMuS` autograd function computes gradients w.r.t. expectation parameters (η₁, η₂):
+  - η₁ = μ
+  - η₂ = s² + μ²
+- **NGD optimizer**: Learning rate `lr=0.1` scaled by `1/num_data` as per natural gradient theory
+
+**Benchmark results** (50 iterations, 5 components, 50 samples):
+- **Standard + expanded**: ELBO = -5266.88
+- **Standard + lower-bound**: ELBO = -6528.74
+- **Natural + expanded**: ELBO = -4186.40 (**+21% improvement**)
+- **Natural + lower-bound**: ELBO = -4989.78 (**+24% improvement**)
+
+**Recommended usage:**
+- **`training_mode='natural'`**: Better ELBO, faster convergence, recommended for most applications
+- **`training_mode='standard'`**: Baseline comparison, simpler implementation
 
 ### 2025-01-03: Add Lower-Bound ELBO Mode with Jensen's Inequality (Commit `c802385`)
 

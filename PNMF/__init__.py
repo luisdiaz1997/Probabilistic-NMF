@@ -21,5 +21,17 @@ __version__ = "0.1.0"
 
 from .models import PNMF, PoissonFactorization
 from .priors import GaussianPrior
+from .elbo import (
+    compute_elbo,
+    compute_expected_log_lik,
+    compute_kl_divergence,
+)
 
-__all__ = ["PNMF", "PoissonFactorization", "GaussianPrior"]
+__all__ = [
+    "PNMF",
+    "PoissonFactorization",
+    "GaussianPrior",
+    "compute_elbo",
+    "compute_expected_log_lik",
+    "compute_kl_divergence",
+]

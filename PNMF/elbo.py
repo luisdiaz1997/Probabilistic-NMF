@@ -1,10 +1,18 @@
 """
 ELBO computation functions for PNMF.
 
-This module provides different strategies for computing the Evidence Lower Bound (ELBO):
+This module provides different strategies for computing the expected log-likelihood
+E[log p(Y|F)] and the full Evidence Lower Bound (ELBO).
+
+Expected log-likelihood modes:
 - simple: Full Monte Carlo estimation using torch.distributions.Poisson
 - expanded: Hybrid Monte Carlo + analytic expectation (default, lower variance)
 - lower-bound: Jensen's lower bound (fully analytic, no MC sampling)
+
+The ELBO is computed as:
+    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+
+The KL divergence is computed separately to allow for custom KL implementations.
 """
 
 import torch
@@ -31,26 +39,27 @@ def poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
     return log_lik
 
 
-def compute_elbo_simple(rate, qF, pF, X):
+# =============================================================================
+# Expected log-likelihood functions (modes)
+# =============================================================================
+
+
+def compute_expected_log_lik_simple(rate, X):
     """
-    Compute ELBO using full Monte Carlo estimation with torch.distributions.Poisson.
+    Compute expected log-likelihood using full Monte Carlo estimation.
 
-    This uses torch.distributions.Poisson.log_prob() for computing the
+    Uses torch.distributions.Poisson.log_prob() for computing the
     log-likelihood, providing a clean and numerically stable implementation.
-
-    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
 
     The Poisson log-likelihood is:
         log p(X|rate) = X * log(rate) - rate - log(X!)
 
     Args:
         rate: Poisson rate tensor of shape (E, D, N)
-        qF: Variational posterior distribution with mean and scale
-        pF: Prior distribution
         X: Input data tensor of shape (D, N)
 
     Returns:
-        Negative ELBO (to minimize)
+        Expected log-likelihood E[log p(Y|F)] (scalar)
     """
     E_samples = rate.shape[0]
 
@@ -62,18 +71,14 @@ def compute_elbo_simple(rate, qF, pF, X):
     log_lik_mc = poisson_dist.log_prob(X_expanded)
 
     # Expected log likelihood via Monte Carlo: (1/E) * sum_e log p(Y|F_e)
-    log_lik = log_lik_mc.sum() / E_samples
+    expected_log_lik = log_lik_mc.sum() / E_samples
 
-    # KL divergence
-    kl = torch.distributions.kl_divergence(qF, pF).sum()
-
-    # Negative ELBO (for minimization)
-    return kl - log_lik
+    return expected_log_lik
 
 
-def compute_elbo_expanded(rate, qF, pF, X, W):
+def compute_expected_log_lik_expanded(rate, qF, X, W):
     """
-    Compute the Evidence Lower BOund (ELBO) using the expanded expectation form.
+    Compute expected log-likelihood using the expanded expectation form.
 
     The expected log-likelihood is computed as:
         E[log p(Y|F)] = Y * E[log(sum(W * exp(F)))] - sum(W * E[exp(F)]) - sum(log(Y!))
@@ -83,17 +88,14 @@ def compute_elbo_expanded(rate, qF, pF, X, W):
     - The second term is computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
     - The third term is the Poisson normalization constant (log factorial)
 
-    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
-
     Args:
         rate: Poisson rate tensor of shape (E, D, N)
         qF: Variational posterior distribution with mean and scale
-        pF: Prior distribution
         X: Input data tensor of shape (D, N)
         W: Loadings matrix tensor of shape (D, L)
 
     Returns:
-        Negative ELBO (to minimize)
+        Expected log-likelihood E[log p(Y|F)] (scalar)
     """
     E_samples = rate.shape[0]
 
@@ -120,18 +122,14 @@ def compute_elbo_expanded(rate, qF, pF, X, W):
 
     # Expected log likelihood (including the Poisson normalization -log(Y!) term)
     # Using lgamma(X+1) = log(X!) for the Poisson PMF normalization
-    log_lik = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
+    expected_log_lik = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
 
-    # KL divergence
-    kl = torch.distributions.kl_divergence(qF, pF).sum()
-
-    # Negative ELBO (for minimization)
-    return kl - log_lik
+    return expected_log_lik
 
 
-def compute_elbo_lower_bound(qF, pF, X, W):
+def compute_expected_log_lik_lower_bound(qF, X, W):
     """
-    Compute ELBO using Jensen's lower bound (fully analytic, no MC sampling).
+    Compute expected log-likelihood using Jensen's lower bound (fully analytic).
 
     Uses Jensen's inequality for the log-sum-exp term:
         E[log Σ W * exp(F)] ≥ log Σ W * exp(E[F])
@@ -139,21 +137,18 @@ def compute_elbo_lower_bound(qF, pF, X, W):
     For Gaussian variational distribution with mean μ and variance σ²:
         E[F] = μ
 
-    This gives a true lower bound on the ELBO with NO Monte Carlo sampling.
+    This gives a true lower bound on E[log p(Y|F)] with NO Monte Carlo sampling.
 
     The expected log-likelihood is computed as:
         E[log p(Y|F)] ≈ Y * log(Σ W * exp(μ)) - Σ W * exp(μ + σ²/2) - log(Y!)
 
-    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
-
     Args:
         qF: Variational posterior distribution with mean and scale
-        pF: Prior distribution
         X: Input data tensor of shape (D, N)
         W: Loadings matrix tensor of shape (D, L)
 
     Returns:
-        Negative ELBO (to minimize)
+        Lower bound on expected log-likelihood E[log p(Y|F)] (scalar)
     """
     # Get variational parameters
     mu = qF.mean  # (L, N)
@@ -178,41 +173,95 @@ def compute_elbo_lower_bound(qF, pF, X, W):
     term2_analytic = torch.matmul(W, exp_expectation).sum()  # scalar
 
     # Expected log likelihood (including Poisson normalization)
-    log_lik = term1_lower - term2_analytic - torch.lgamma(X + 1).sum()
+    # Note: Since we use a lower bound on the log term, this is a true lower bound
+    expected_log_lik = term1_lower - term2_analytic - torch.lgamma(X + 1).sum()
 
-    # KL divergence
-    kl = torch.distributions.kl_divergence(qF, pF).sum()
-
-    # Negative ELBO (for minimization)
-    # Note: Since we use a lower bound on the log term, this is a true lower bound on ELBO
-    return kl - log_lik
+    return expected_log_lik
 
 
-def compute_elbo(mode, rate, qF, pF, X, W):
+def compute_expected_log_lik(mode, rate, qF, X, W):
     """
-    Compute the Evidence Lower BOund (ELBO).
+    Compute expected log-likelihood E[log p(Y|F)].
 
-    This function dispatches to the appropriate ELBO computation based on mode:
+    This function dispatches to the appropriate computation based on mode:
     - 'simple': Uses torch.distributions.Poisson.log_prob() directly
     - 'expanded': Uses hybrid Monte Carlo + analytic expectation
     - 'lower-bound': Uses Jensen's lower bound (fully analytic, no MC)
 
-    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+    Args:
+        mode: Computation mode ('simple', 'expanded', or 'lower-bound')
+        rate: Poisson rate tensor of shape (E, D, N) [unused for lower-bound]
+        qF: Variational posterior distribution with mean and scale
+        X: Input data tensor of shape (D, N)
+        W: Loadings matrix tensor of shape (D, L)
+
+    Returns:
+        Expected log-likelihood E[log p(Y|F)] (scalar)
+    """
+    if mode == 'simple':
+        return compute_expected_log_lik_simple(rate, X)
+    elif mode == 'lower-bound':
+        return compute_expected_log_lik_lower_bound(qF, X, W)
+    else:  # 'expanded'
+        return compute_expected_log_lik_expanded(rate, qF, X, W)
+
+
+# =============================================================================
+# KL divergence
+# =============================================================================
+
+
+def compute_kl_divergence(qF, pF):
+    """
+    Compute KL divergence between variational posterior and prior.
+
+    KL[q(F) || p(F)]
 
     Args:
-        mode: ELBO computation mode ('simple', 'expanded', or 'lower-bound')
+        qF: Variational posterior distribution
+        pF: Prior distribution
+
+    Returns:
+        KL divergence (scalar)
+    """
+    return torch.distributions.kl_divergence(qF, pF).sum()
+
+
+# =============================================================================
+# Full ELBO computation
+# =============================================================================
+
+
+def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None):
+    """
+    Compute the Evidence Lower BOund (ELBO).
+
+    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+
+    This function computes the expected log-likelihood using the specified mode
+    and subtracts the KL divergence. A custom KL function can be provided.
+
+    Args:
+        mode: Expected log-likelihood mode ('simple', 'expanded', or 'lower-bound')
         rate: Poisson rate tensor of shape (E, D, N) [unused for lower-bound]
         qF: Variational posterior distribution with mean and scale
         pF: Prior distribution
         X: Input data tensor of shape (D, N)
         W: Loadings matrix tensor of shape (D, L)
+        kl_fn: Optional custom KL divergence function. If None, uses standard
+               torch.distributions.kl_divergence. Should take (qF, pF) and return scalar.
 
     Returns:
         Negative ELBO (to minimize)
     """
-    if mode == 'simple':
-        return compute_elbo_simple(rate, qF, pF, X)
-    elif mode == 'lower-bound':
-        return compute_elbo_lower_bound(qF, pF, X, W)
-    else:  # 'expanded'
-        return compute_elbo_expanded(rate, qF, pF, X, W)
+    # Compute expected log-likelihood using the specified mode
+    expected_log_lik = compute_expected_log_lik(mode, rate, qF, X, W)
+
+    # Compute KL divergence (use custom function if provided)
+    if kl_fn is not None:
+        kl = kl_fn(qF, pF)
+    else:
+        kl = compute_kl_divergence(qF, pF)
+
+    # Negative ELBO (for minimization)
+    return kl - expected_log_lik
