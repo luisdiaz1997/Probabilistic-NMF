@@ -67,37 +67,55 @@ class PoissonFactorization(nn.Module):
         # Loadings matrix W (D x L) - positive parameters
         self.W = PositiveParameter((D, L), mode=loadings_mode)
 
-    def get_rate(self, prior_samples):
+    def get_rate(self, prior_samples, idy=None):
         """
         Compute the Poisson rate from prior samples.
 
         Args:
             prior_samples: Samples from the prior of shape (E, L, N)
                           where E is number of samples, L is components, N is samples
+            idy: Feature indices for batching (D dimension), None for full features
 
         Returns:
-            Z: Rate matrix of shape (E, D, N) where D is features
+            Z: Rate matrix of shape (E, D, N) or (E, D_batch, batch_size)
         """
         F = torch.exp(prior_samples)  # shape (E, L, N)
         W = self.W.data  # shape (D, L)
+        if idy is not None:
+            W = W[idy]  # (D_batch, L)
         Z = torch.matmul(W, F)  # shape (E, D, N)
         return Z
 
-    def forward(self, E=10):
+    def forward(self, idx=None, idy=None, E=10):
         """
         Forward pass generating Poisson rate.
 
+        Supports both full-batch and mini-batch training. When idx and idy are
+        None, performs full-batch forward pass. Otherwise, computes on the
+        specified batch indices.
+
         Args:
+            idx: Sample indices (for N dimension), None for full samples
+            idy: Feature indices (for D dimension), None for full features
             E: Number of Monte Carlo samples for variational inference
 
         Returns:
-            rate: Poisson rate tensor of shape (E, D, N)
-            qF: Variational posterior distribution
-            pF: Prior distribution
+            rate: Poisson rate tensor of shape (E, D_batch, N_batch)
+            qF: Variational posterior distribution (batched if idx provided)
+            pF: Prior distribution (batched if idx provided)
         """
-        qF, pF = self.prior()
-        F = qF.rsample((E,))  # Reparameterization trick, shape (E, L, N)
-        rate = self.get_rate(F)  # shape (E, D, N)
+        # Get variational distributions (batched on samples if idx provided)
+        if idx is not None:
+            qF, pF = self.prior.forward_batched(idx)
+        else:
+            qF, pF = self.prior()
+
+        # Sample F using reparameterization trick: shape (E, L, batch_size)
+        F = qF.rsample((E,))
+
+        # Compute rate using get_rate (F is the prior samples, not exp(F))
+        rate = self.get_rate(F, idy=idy)  # shape (E, D, N)
+
         return rate, qF, pF
 
     def project_parameters(self):
@@ -168,6 +186,17 @@ class PNMF:
         Device to use for computation. 'auto' will select mps (Apple Silicon),
         cuda (NVIDIA), or cpu in that order based on availability.
 
+    batch_size : int, default=None
+        Size of mini-batches for samples (N dimension). If None, uses full batch.
+        Enable mini-batch training for large datasets.
+
+    y_batch_size : int, default=None
+        Size of mini-batches for features (M/D dimension). If None, uses all features.
+        Enable feature batching for very wide datasets.
+
+    shuffle : bool, default=True
+        Whether to shuffle sample indices between iterations (for mini-batch mode).
+
     Attributes
     ----------
     components_ : ndarray of shape (n_components, n_features)
@@ -194,6 +223,12 @@ class PNMF:
     >>> transformed = model.fit_transform(X)  # exp(F): (100, 5) transformed data
     >>> components = model.components_        # W.T: (5, 50) components
     >>> X_reconstructed = model.inverse_transform(transformed)
+
+    Mini-batch training for large datasets:
+
+    >>> X_large = np.random.rand(10000, 500)
+    >>> model = PNMF(n_components=10, batch_size=1000, shuffle=True)
+    >>> model.fit(X_large)
     """
 
     def __init__(
@@ -209,7 +244,10 @@ class PNMF:
         optimizer: str = 'Adam',
         random_state: Optional[int] = None,
         verbose: bool = False,
-        device: str = 'auto'
+        device: str = 'auto',
+        batch_size: Optional[int] = None,
+        y_batch_size: Optional[int] = None,
+        shuffle: bool = True
     ):
         self.n_components = n_components
         self.loadings_mode = loadings_mode
@@ -223,6 +261,9 @@ class PNMF:
         self.random_state = random_state
         self.verbose = verbose
         self.device = device
+        self.batch_size = batch_size
+        self.y_batch_size = y_batch_size
+        self.shuffle = shuffle
 
         # Attributes set during fit
         self.components_ = None
@@ -264,6 +305,12 @@ class PNMF:
         if self.optimizer not in ['Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop']:
             raise ValueError("optimizer must be 'Adam', 'AdamW', 'NAdam', 'SGD', or 'RMSprop'")
 
+        if self.batch_size is not None and self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1 or None")
+
+        if self.y_batch_size is not None and self.y_batch_size < 1:
+            raise ValueError("y_batch_size must be >= 1 or None")
+
     def _get_device(self):
         """Determine the device to use."""
         if self.device == 'auto':
@@ -274,6 +321,45 @@ class PNMF:
             else:
                 return torch.device('cpu')
         return torch.device(self.device)
+
+    def _get_batch_indices(self, N, D, device):
+        """
+        Sample batch indices for mini-batch training.
+
+        Following GPzoo pattern from training_utilities.py:181-182.
+
+        Args:
+            N: Total number of samples
+            D: Total number of features
+            device: Device to place indices on
+
+        Returns:
+            idx: Sample indices (x_batch_size,) or None if full batch
+            idy: Feature indices (y_batch_size,) or None if full features
+        """
+        # Sample batch (N dimension)
+        if self.batch_size is not None:
+            x_batch_size = min(self.batch_size, N)
+            idx = torch.multinomial(
+                torch.ones(N, device=device),
+                num_samples=x_batch_size,
+                replacement=False
+            )
+        else:
+            idx = None
+
+        # Feature batch (D dimension)
+        if self.y_batch_size is not None:
+            y_batch_size = min(self.y_batch_size, D)
+            idy = torch.multinomial(
+                torch.ones(D, device=device),
+                num_samples=y_batch_size,
+                replacement=False
+            )
+        else:
+            idy = None
+
+        return idx, idy
 
     def fit(
         self,
@@ -379,8 +465,20 @@ class PNMF:
         prev_elbo = float('-inf')
         elbo_history = [] if return_history else None
 
+        # Determine if we're using batched training
+        use_batching = self.batch_size is not None or self.y_batch_size is not None
+        D, N = X_torch.shape  # D = features, N = samples
+
+        # Calculate batch sizes (for ELBO scaling)
+        x_batch_size = self.batch_size if self.batch_size is not None else N
+        y_batch_size = self.y_batch_size if self.y_batch_size is not None else D
+
         # Update progress bar description based on training mode
         mode_desc = f"{self.mode} mode, {self.training_mode} training"
+        if use_batching:
+            mode_desc += f", batch={x_batch_size}"
+            if self.y_batch_size is not None:
+                mode_desc += f", y_batch={y_batch_size}"
         pbar = tqdm(range(self.max_iter), disable=self.verbose, desc=f"PNMF fitting ({mode_desc})")
 
         for iteration in pbar:
@@ -389,12 +487,35 @@ class PNMF:
             if self._w_optimizer is not None:
                 self._w_optimizer.zero_grad()
 
-            # Forward pass
-            rate, qF, pF = self._model.forward(E=self.E)
+            # Get batch indices (None for full-batch mode)
+            idx, idy = self._get_batch_indices(N, D, self._get_device()) if use_batching else (None, None)
+
+            # Get data batch
+            if idx is not None and idy is not None:
+                X_batch = X_torch[idy][:, idx]
+            elif idx is not None:
+                X_batch = X_torch[:, idx]
+            elif idy is not None:
+                X_batch = X_torch[idy]
+            else:
+                X_batch = X_torch
+
+            # Forward pass (handles both batched and full modes)
+            rate, qF, pF = self._model.forward(idx, idy, E=self.E)
+
+            # Get W (optionally batched)
+            W = self._model.W.data
+            if idy is not None:
+                W = W[idy]
 
             # Compute ELBO loss
-            W = self._model.W.data
-            loss = compute_elbo(self.mode, rate, qF, pF, X_torch, W)
+            loss = compute_elbo(self.mode, rate, qF, pF, X_batch, W)
+
+            # Scale ELBO for mini-batch
+            if self.y_batch_size is not None:
+                loss = loss * (D / min(self.y_batch_size, D))
+            if self.batch_size is not None:
+                loss = loss * (N / min(self.batch_size, N))
 
             # Backward pass
             loss.backward()
@@ -412,7 +533,7 @@ class PNMF:
             if self.loadings_mode == 'projected':
                 self._model.project_parameters()
 
-            # Check convergence
+            # Check convergence (using scaled loss for batched mode)
             elbo_value = -loss.item()  # Convert back to ELBO
 
             # Track ELBO history
