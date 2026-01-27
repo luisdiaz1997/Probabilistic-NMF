@@ -1,5 +1,9 @@
 # PNMF Development Notes
 
+## Development Workflow
+
+**Important**: Every time we make a new plan or significant feature, we will create a new git branch. The PLAN.md file lives on the feature branch, not on main.
+
 ## Project Overview
 
 This document describes the development of the PNMF (Probabilistic Non-negative Matrix Factorization) library, a pip-installable Python package with a scikit-learn compatible API using **variational inference**.
