@@ -286,6 +286,117 @@ class TestPyTorchAPI:
 
 
 # =============================================================================
+# Test batched training
+# =============================================================================
+
+
+class TestBatchedPNMF:
+    """Test batched training functionality."""
+
+    def test_batch_size_runs(self):
+        """Test that batch_size parameter works."""
+        X = generate_small_count_data()
+        model = PNMF(n_components=5, batch_size=10, max_iter=20)
+        model.fit(X)
+        assert model.elbo_ is not None
+        assert model.components_.shape == (5, X.shape[1])
+
+    def test_y_batch_size_runs(self):
+        """Test that y_batch_size parameter works."""
+        X = generate_small_count_data()
+        model = PNMF(n_components=5, y_batch_size=8, max_iter=20)
+        model.fit(X)
+        assert model.elbo_ is not None
+        assert model.components_.shape == (5, X.shape[1])
+
+    def test_dual_batching(self):
+        """Test both batch_size and y_batch_size together."""
+        X = generate_small_count_data()
+        model = PNMF(n_components=5, batch_size=10, y_batch_size=8, max_iter=20)
+        model.fit(X)
+        assert model.elbo_ is not None
+        assert model.components_.shape == (5, X.shape[1])
+
+    def test_batched_elbo_improves(self):
+        """Test that ELBO improves during batched training."""
+        X = generate_small_count_data()
+
+        model = PNMF(n_components=5, batch_size=10, max_iter=50)
+        history, _ = model.fit(X, return_history=True)
+
+        # ELBO should generally improve (allow some noise for batched)
+        # Check if final ELBO is better than initial
+        assert history[-1] > history[0], "ELBO should improve during batched training"
+
+    def test_batched_vs_full_comparable(self):
+        """Test that batched and full-batch produce similar results."""
+        X = generate_count_data(n_samples=50, n_features=30, seed=42)
+
+        # Full batch training
+        model_full = PNMF(n_components=5, max_iter=100, random_state=42)
+        model_full.fit(X)
+
+        # Batched training (larger batch for more stability)
+        model_batched = PNMF(n_components=5, batch_size=25, max_iter=100, random_state=42)
+        model_batched.fit(X)
+
+        # Both should produce valid ELBO values (negative)
+        assert model_full.elbo_ < 0
+        assert model_batched.elbo_ < 0
+
+        # Reconstruction quality should be similar (within tolerance)
+        transformed_full = model_full.transform(X)
+        transformed_batched = model_batched.transform(X)
+        recon_full = model_full.inverse_transform(transformed_full)
+        recon_batched = model_batched.inverse_transform(transformed_batched)
+
+        error_full = np.mean((X - recon_full) ** 2)
+        error_batched = np.mean((X - recon_batched) ** 2)
+
+        # Batched error should be within 2x of full batch error
+        assert error_batched < error_full * 2, "Batched should have similar reconstruction"
+
+    def test_shuffle_parameter(self):
+        """Test that shuffle parameter works."""
+        X = generate_small_count_data()
+        model = PNMF(n_components=5, batch_size=10, shuffle=True, max_iter=10)
+        model.fit(X)
+        assert model.elbo_ is not None
+
+        model_no_shuffle = PNMF(n_components=5, batch_size=10, shuffle=False, max_iter=10)
+        model_no_shuffle.fit(X)
+        assert model_no_shuffle.elbo_ is not None
+
+    def test_batched_with_modes(self):
+        """Test batched training with different ELBO modes."""
+        X = generate_small_count_data()
+
+        for mode in ['simple', 'expanded', 'lower-bound']:
+            model = PNMF(n_components=5, mode=mode, batch_size=10, max_iter=20)
+            model.fit(X)
+            assert model.elbo_ is not None, f"Batched {mode} mode failed"
+
+    def test_batched_with_natural_gradients(self):
+        """Test batched training with natural gradient mode."""
+        X = generate_small_count_data()
+        model = PNMF(
+            n_components=5,
+            training_mode='natural',
+            batch_size=10,
+            max_iter=20
+        )
+        model.fit(X)
+        assert model.elbo_ is not None
+
+    def test_batch_size_larger_than_data(self):
+        """Test that batch_size larger than data works (clamped to N)."""
+        X = generate_small_count_data()  # 20 samples
+        model = PNMF(n_components=5, batch_size=100, max_iter=10)  # batch > samples
+        model.fit(X)
+        assert model.elbo_ is not None
+
+
+# =============================================================================
 # Test parameter validation
 # =============================================================================
 
@@ -311,6 +422,18 @@ class TestParameterValidation:
             model = PNMF(training_mode='invalid')
             model.fit(generate_small_count_data())
 
+    def test_invalid_batch_size(self):
+        """Test that invalid batch_size raises error."""
+        with pytest.raises(ValueError):
+            model = PNMF(batch_size=0)
+            model.fit(generate_small_count_data())
+
+    def test_invalid_y_batch_size(self):
+        """Test that invalid y_batch_size raises error."""
+        with pytest.raises(ValueError):
+            model = PNMF(y_batch_size=-1)
+            model.fit(generate_small_count_data())
+
 
 # =============================================================================
 # Run tests
@@ -325,6 +448,7 @@ def run_all_tests():
         TestTrainingModes,
         TestELBOFunctions,
         TestPyTorchAPI,
+        TestBatchedPNMF,
         TestParameterValidation,
     ]
 
