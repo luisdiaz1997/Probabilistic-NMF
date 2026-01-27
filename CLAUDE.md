@@ -1,5 +1,9 @@
 # PNMF Development Notes
 
+## Development Workflow
+
+**Important**: Every time we make a new plan or significant feature, we will create a new git branch. The PLAN.md file lives on the feature branch, not on main.
+
 ## Project Overview
 
 This document describes the development of the PNMF (Probabilistic Non-negative Matrix Factorization) library, a pip-installable Python package with a scikit-learn compatible API using **variational inference**.
@@ -16,10 +20,12 @@ Probabilistic-NMF/
 │   ├── priors.py            # GaussianPrior class for variational inference
 │   ├── elbo.py              # Expected log-likelihood and ELBO computation
 │   ├── optimizers.py        # Custom optimizers (NaturalGradientDescent)
-│   └── custom_modules.py    # Constrained parameter classes (ConstrainedParameter, PositiveParameter)
+│   ├── custom_modules.py    # Constrained parameter classes (ConstrainedParameter, PositiveParameter)
+│   └── transforms.py        # Transform and utility functions for factor extraction
 ├── tests/                   # Test suite
 │   ├── __init__.py
-│   └── test_pnmf.py         # Pytest tests for all components
+│   ├── test_pnmf.py         # Pytest tests for core components
+│   └── test_transforms.py   # Pytest tests for transforms module
 ├── benchmarks/              # Benchmark scripts and notebooks
 │   ├── README.md            # Benchmark documentation
 │   ├── simple_vs_expanded.py    # Standalone benchmark script
@@ -409,6 +415,69 @@ Potential improvements:
 - Add benchmarking against sklearn NMF
 
 ## Recent Changes
+
+### 2025-01-27: Add General Transforms and Utility Functions
+
+**What was changed:**
+- Created new `PNMF/transforms.py` module with transform and utility functions
+- Added factor extraction functions: `log_factors()`, `factors()`, `factor_uncertainty()`, `factor_samples()`
+- Added model accessor functions: `get_loadings()`, `get_prior()`
+- Added conditional inference functions: `transform_F()`, `transform_W()`
+- Added prior utility functions: `log_factors_from_prior()`, `factors_from_prior()`, `uncertainty_from_prior()`
+- Updated `__init__.py` to export all new functions
+- Created comprehensive test suite in `tests/test_transforms.py` (40 tests)
+- Updated `docs/api.rst` with new function documentation
+- Updated `docs/examples.rst` with usage examples
+
+**Why it matters:**
+- **Factor extraction**: Easy access to latent factors in log-space (`log_factors`), exp-space (`factors`), with uncertainty (`factor_uncertainty`), or as samples (`factor_samples`)
+- **Bayesian transform**: `transform_F` learns a full variational distribution for new data (better than NNLS-based `transform`)
+- **Flexible conditioning**: Can condition on either F (`transform_W`) or W (`transform_F`) to learn the other
+- **Uncertainty quantification**: Sample from q(F) and propagate uncertainty through downstream analysis
+
+**Module structure:**
+```python
+# PNMF/transforms.py
+
+# Factor extraction
+def log_factors(model, return_tensor=False) -> ndarray  # μ from q(F)
+def factors(model, use_mgf=True, return_tensor=False) -> ndarray  # E[exp(F)]
+def factor_uncertainty(model, return_variance=False, return_tensor=False) -> ndarray  # σ or σ²
+def factor_samples(model, n_samples=100, return_exp=False, return_tensor=False) -> ndarray
+
+# Model accessors
+def get_loadings(model, return_tensor=False) -> ndarray  # W matrix
+def get_prior(model) -> GaussianPrior  # Full prior object
+
+# Conditional inference
+def transform_F(X, W, ..., return_prior=False) -> ndarray or GaussianPrior
+def transform_W(X, F, ...) -> ndarray
+
+# Prior utilities
+def log_factors_from_prior(prior, return_tensor=False) -> ndarray
+def factors_from_prior(prior, use_mgf=True, return_tensor=False) -> ndarray
+def uncertainty_from_prior(prior, return_variance=False, return_tensor=False) -> ndarray
+```
+
+**Usage example:**
+```python
+from PNMF import PNMF, log_factors, factors, factor_uncertainty, get_loadings, transform_F
+import numpy as np
+
+# Fit model
+X_train = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+model = PNMF(n_components=5).fit(X_train)
+
+# Extract factors
+F_log = log_factors(model)        # (100, 5) - μ from q(F)
+F_exp = factors(model)            # (100, 5) - E[exp(F)] = exp(μ + σ²/2)
+F_std = factor_uncertainty(model) # (100, 5) - σ from q(F)
+
+# Transform new data with full VI
+X_test = np.random.poisson(5, size=(20, 50)).astype(np.float32)
+W = get_loadings(model)
+F_test = transform_F(X_test, W, max_iter=100)  # (20, 5)
+```
 
 ### 2025-01-14: Separate expected log-likelihood from KL divergence in elbo.py
 

@@ -93,3 +93,140 @@ Customizing Optimization
    )
 
    model.fit(X)
+
+Extracting Latent Factors
+-------------------------
+
+After fitting a model, you can extract latent factors in different forms:
+
+.. code-block:: python
+
+   from PNMF import PNMF, log_factors, factors, factor_uncertainty, factor_samples
+   import numpy as np
+
+   # Fit model
+   X = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+   model = PNMF(n_components=5, random_state=42)
+   model.fit(X)
+
+   # Get log-space factors (μ from q(F) = Normal(μ, σ²))
+   F_log = log_factors(model)  # Shape: (100, 5)
+
+   # Get exp-space factors using moment-generating function
+   # E[exp(F)] = exp(μ + σ²/2)
+   F_exp = factors(model)  # Shape: (100, 5)
+
+   # Get exp-space factors without MGF correction (biased)
+   F_exp_biased = factors(model, use_mgf=False)  # exp(μ)
+
+   # Get uncertainty (standard deviation)
+   F_std = factor_uncertainty(model)  # Shape: (100, 5)
+
+   # Get variance
+   F_var = factor_uncertainty(model, return_variance=True)
+
+   # Sample from the variational posterior
+   samples = factor_samples(model, n_samples=100)  # Shape: (100, 100, 5)
+   exp_samples = factor_samples(model, n_samples=100, return_exp=True)
+
+Accessing Model Components
+--------------------------
+
+.. code-block:: python
+
+   from PNMF import PNMF, get_loadings, get_prior
+   import numpy as np
+
+   X = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+   model = PNMF(n_components=5).fit(X)
+
+   # Get loadings matrix W (shape: n_features x n_components)
+   W = get_loadings(model)  # Shape: (50, 5)
+
+   # This is equivalent to model.components_.T
+   assert np.array_equal(W, model.components_.T)
+
+   # Get the GaussianPrior object for advanced users
+   prior = get_prior(model)
+   qF, pF = prior()  # Get variational and prior distributions
+
+Conditional Inference
+---------------------
+
+Transform New Data with Full Variational Inference
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The :func:`~PNMF.transforms.transform_F` function learns a full variational
+distribution for new data, given fixed loadings W:
+
+.. code-block:: python
+
+   from PNMF import PNMF, transform_F, get_loadings
+   from PNMF.transforms import log_factors_from_prior, factors_from_prior
+   import numpy as np
+
+   # Fit model on training data
+   X_train = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+   model = PNMF(n_components=5, max_iter=100).fit(X_train)
+   W = get_loadings(model)
+
+   # Transform new data with full VI (better than NNLS-based transform)
+   X_test = np.random.poisson(5, size=(20, 50)).astype(np.float32)
+   F_test = transform_F(X_test, W, max_iter=100)  # Shape: (20, 5)
+
+   # Or get the full prior object for uncertainty quantification
+   prior_test = transform_F(X_test, W, max_iter=100, return_prior=True)
+   F_test_log = log_factors_from_prior(prior_test)
+   F_test_exp = factors_from_prior(prior_test)
+
+Learning New Loadings
+~~~~~~~~~~~~~~~~~~~~~
+
+The :func:`~PNMF.transforms.transform_W` function learns new loadings W
+conditioned on fixed latent factors F:
+
+.. code-block:: python
+
+   from PNMF import PNMF, transform_W, log_factors
+   import numpy as np
+
+   # Fit model
+   X = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+   model = PNMF(n_components=5, max_iter=100).fit(X)
+   F_log = log_factors(model)
+
+   # Learn new W for same data (useful for transfer learning)
+   W_new = transform_W(X, F_log, max_iter=100)  # Shape: (50, 5)
+
+Uncertainty Quantification
+--------------------------
+
+PNMF provides full uncertainty quantification through the variational posterior:
+
+.. code-block:: python
+
+   from PNMF import PNMF, factors, factor_uncertainty, factor_samples, get_loadings
+   import numpy as np
+
+   # Fit model
+   X = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+   model = PNMF(n_components=5, max_iter=100).fit(X)
+
+   # Point estimates
+   F_exp = factors(model)
+   F_std = factor_uncertainty(model)
+
+   # Reconstruct with uncertainty
+   W = get_loadings(model)
+   X_recon = F_exp @ W.T
+
+   # Propagate uncertainty through sampling
+   n_mc_samples = 1000
+   samples = factor_samples(model, n_samples=n_mc_samples, return_exp=True)
+
+   # Compute reconstruction uncertainty
+   reconstructions = np.array([s @ W.T for s in samples])
+   recon_mean = reconstructions.mean(axis=0)
+   recon_std = reconstructions.std(axis=0)
+
+   print(f"Reconstruction uncertainty: {recon_std.mean():.4f}")
