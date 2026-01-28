@@ -11,7 +11,7 @@ import pytest
 from PNMF import PNMF
 from PNMF import (
     log_factors,
-    factors,
+    get_factors,
     factor_uncertainty,
     factor_samples,
     get_loadings,
@@ -99,34 +99,34 @@ class TestLogFactors:
             log_factors(model)
 
 
-class TestFactors:
-    """Test factors function."""
+class TestGetFactors:
+    """Test get_factors function."""
 
-    def test_factors_shape(self, fitted_model):
-        """Test that factors returns correct shape."""
+    def test_get_factors_shape(self, fitted_model):
+        """Test that get_factors returns correct shape."""
         model, X = fitted_model
-        F_exp = factors(model)
+        F_exp = get_factors(model)
         assert F_exp.shape == (X.shape[0], model.n_components_)
 
-    def test_factors_positive(self, fitted_model):
-        """Test that factors returns positive values (exp-space)."""
+    def test_get_factors_positive(self, fitted_model):
+        """Test that get_factors returns positive values (exp-space)."""
         model, _ = fitted_model
-        F_exp = factors(model)
+        F_exp = get_factors(model)
         assert np.all(F_exp > 0)
 
-    def test_factors_mgf_vs_direct(self, fitted_model):
+    def test_get_factors_mgf_vs_direct(self, fitted_model):
         """Test that MGF gives different results than direct exp."""
         model, _ = fitted_model
-        F_mgf = factors(model, use_mgf=True)
-        F_direct = factors(model, use_mgf=False)
+        F_mgf = get_factors(model, use_mgf=True)
+        F_direct = get_factors(model, use_mgf=False)
 
         # MGF should give larger values (exp(μ + σ²/2) > exp(μ) when σ > 0)
         assert np.mean(F_mgf) >= np.mean(F_direct) - 1e-6
 
-    def test_factors_returns_tensor(self, fitted_model):
-        """Test that factors returns tensor when requested."""
+    def test_get_factors_returns_tensor(self, fitted_model):
+        """Test that get_factors returns tensor when requested."""
         model, _ = fitted_model
-        F_exp = factors(model, return_tensor=True)
+        F_exp = get_factors(model, return_tensor=True)
         assert isinstance(F_exp, torch.Tensor)
 
 
@@ -320,42 +320,43 @@ class TestTransformW:
     def test_transform_W_shape(self, fitted_model):
         """Test that transform_W returns correct shape."""
         model, X = fitted_model
-        F_log = log_factors(model)
+        F_exp = get_factors(model)  # Uses exp-space factors
 
         # Learn new W for same data
-        W_new = transform_W(X, F_log, max_iter=20)
+        W_new = transform_W(X, F_exp, max_iter=20)
 
         assert W_new.shape == (X.shape[1], model.n_components_)
 
     def test_transform_W_positive(self, fitted_model):
         """Test that transform_W returns positive values."""
         model, X = fitted_model
-        F_log = log_factors(model)
+        F_exp = get_factors(model)
 
-        W_new = transform_W(X, F_log, max_iter=20, loadings_mode='projected')
+        W_new = transform_W(X, F_exp, max_iter=20)
 
         assert np.all(W_new >= 0)
 
     def test_transform_W_dimension_mismatch(self, fitted_model):
         """Test that transform_W raises error on dimension mismatch."""
         model, X = fitted_model
-        F_log = log_factors(model)
+        F_exp = get_factors(model)
 
         # Wrong number of samples
         X_bad = np.random.rand(100, X.shape[1]).astype(np.float32)
         with pytest.raises(ValueError, match="mismatch"):
-            transform_W(X_bad, F_log)
+            transform_W(X_bad, F_exp)
 
-    def test_transform_W_loadings_modes(self, fitted_model):
-        """Test transform_W with different loadings modes."""
+    def test_transform_W_with_init(self, fitted_model):
+        """Test transform_W with initial W provided."""
         model, X = fitted_model
-        F_log = log_factors(model)
+        F_exp = get_factors(model)
 
-        for mode in ['softplus', 'exp', 'projected']:
-            W_new = transform_W(X, F_log, loadings_mode=mode, max_iter=20)
-            assert W_new.shape == (X.shape[1], model.n_components_)
-            # All modes should produce non-negative values
-            assert np.all(W_new >= -1e-6), f"{mode} produced negative values"
+        # Provide initial W
+        W_init = np.random.rand(X.shape[1], model.n_components_).astype(np.float32) * 0.1
+        W_new = transform_W(X, F_exp, W_init=W_init, max_iter=20)
+
+        assert W_new.shape == (X.shape[1], model.n_components_)
+        assert np.all(W_new >= 0)
 
 
 # =============================================================================
@@ -377,12 +378,13 @@ class TestPriorUtilities:
         np.testing.assert_array_equal(F_log_model, F_log_prior)
 
     def test_factors_from_prior(self, fitted_model):
-        """Test factors_from_prior matches factors."""
+        """Test factors_from_prior matches get_factors."""
         model, X = fitted_model
         prior = get_prior(model)
 
-        F_exp_model = factors(model)
-        F_exp_prior = factors_from_prior(prior)
+        # Test with same use_mgf setting
+        F_exp_model = get_factors(model, use_mgf=True)
+        F_exp_prior = factors_from_prior(prior, use_mgf=True)
 
         np.testing.assert_array_equal(F_exp_model, F_exp_prior)
 
@@ -422,11 +424,11 @@ class TestPriorUtilities:
 class TestIntegration:
     """Integration tests for transforms module."""
 
-    def test_reconstruction_with_factors(self, fitted_model):
+    def test_reconstruction_with_get_factors(self, fitted_model):
         """Test that factors and loadings can reconstruct data."""
         model, X = fitted_model
 
-        F_exp = factors(model)
+        F_exp = get_factors(model)
         W = get_loadings(model)
 
         # Reconstruct: X ≈ exp(F) @ W.T
@@ -462,7 +464,7 @@ class TestIntegration:
         model.fit(X_train)
 
         # Extract factors and loadings from training
-        F_train = factors(model)
+        F_train = get_factors(model)
         W = get_loadings(model)
 
         # Transform test data with full VI
@@ -486,7 +488,7 @@ class TestIntegration:
 
         # Get point estimates
         F_log = log_factors(model)
-        F_exp = factors(model)
+        F_exp = get_factors(model)
         F_std = factor_uncertainty(model)
 
         # Get samples for uncertainty propagation
@@ -501,7 +503,7 @@ class TestIntegration:
         # Verify MGF relationship approximately holds for samples
         sample_mean = samples.mean(axis=0)
         # E[exp(F)] ≈ exp(μ + σ²/2) for large number of samples
-        expected_mean = factors(model, use_mgf=True)
+        expected_mean = get_factors(model, use_mgf=True)
         # Relaxed tolerance for stochastic comparison
         np.testing.assert_array_almost_equal(sample_mean, expected_mean, decimal=0)
 
@@ -515,7 +517,7 @@ def run_all_tests():
     """Run all tests without pytest."""
     test_classes = [
         TestLogFactors,
-        TestFactors,
+        TestGetFactors,
         TestFactorUncertainty,
         TestFactorSamples,
         TestGetLoadings,

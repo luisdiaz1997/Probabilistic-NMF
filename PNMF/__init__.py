@@ -33,7 +33,7 @@ from .elbo import (
 from .transforms import (
     # Factor extraction
     log_factors,
-    factors,
+    get_factors,
     factor_uncertainty,
     factor_samples,
     # Model accessors
@@ -59,7 +59,7 @@ __all__ = [
     "kl_divergence",
     # Factor extraction
     "log_factors",
-    "factors",
+    "get_factors",
     "factor_uncertainty",
     "factor_samples",
     # Model accessors

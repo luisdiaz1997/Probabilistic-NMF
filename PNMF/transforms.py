@@ -13,7 +13,6 @@ import numpy as np
 from typing import Union, Optional
 from tqdm.auto import tqdm
 
-from .custom_modules import PositiveParameter
 from .elbo import compute_elbo
 from .priors import GaussianPrior
 
@@ -69,9 +68,9 @@ def log_factors(model, return_tensor: bool = False) -> Union[np.ndarray, torch.T
     return F_log.cpu().numpy()
 
 
-def factors(
+def get_factors(
     model,
-    use_mgf: bool = True,
+    use_mgf: bool = False,
     return_tensor: bool = False
 ) -> Union[np.ndarray, torch.Tensor]:
     """
@@ -84,7 +83,7 @@ def factors(
     ----------
     model : PNMF
         A fitted PNMF model.
-    use_mgf : bool, default=True
+    use_mgf : bool, default=False
         If True, compute E[exp(F)] = exp(μ + σ²/2) using the MGF.
         If False, compute exp(μ) directly.
     return_tensor : bool, default=False
@@ -492,39 +491,33 @@ def transform_F(
 def transform_W(
     X: Union[np.ndarray, torch.Tensor],
     F: Union[np.ndarray, torch.Tensor],
+    W_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     n_components: Optional[int] = None,
-    loadings_mode: str = 'projected',
-    mode: str = 'expanded',
-    E: int = 3,
-    max_iter: int = 200,
+    max_iter: int = 100,
     tol: float = 1e-4,
-    learning_rate: float = 0.01,
     verbose: bool = False,
     device: str = 'auto'
 ) -> np.ndarray:
     """
     Learn new loadings W conditioned on fixed latent factors F.
 
+    Uses multiplicative updates (NNLS-style) for fast convergence while
+    displaying the Poisson negative log-likelihood on the progress bar.
+
     Parameters
     ----------
     X : array-like of shape (n_samples, n_features)
         Data to fit.
     F : array-like of shape (n_samples, n_components)
-        Fixed latent factors in log-space (μ from q(F)).
+        Fixed latent factors in exp-space (exp(F) from the model).
+    W_init : array-like of shape (n_features, n_components), optional
+        Initial loadings W. If None, uses random initialization.
     n_components : int, optional
         Number of components. Inferred from F if not specified.
-    loadings_mode : {'softplus', 'exp', 'projected'}, default='projected'
-        Method for enforcing non-negativity on W.
-    mode : {'simple', 'expanded', 'lower-bound'}, default='expanded'
-        ELBO computation mode (only 'lower-bound' uses F directly).
-    E : int, default=3
-        Number of Monte Carlo samples (only used for 'simple' and 'expanded').
-    max_iter : int, default=200
+    max_iter : int, default=100
         Maximum number of iterations.
     tol : float, default=1e-4
         Tolerance for convergence.
-    learning_rate : float, default=0.01
-        Learning rate for the optimizer.
     verbose : bool, default=False
         Whether to print progress messages.
     device : {'cpu', 'cuda', 'mps', 'auto'}, default='auto'
@@ -537,8 +530,14 @@ def transform_W(
 
     Notes
     -----
-    This function treats F as fixed point estimates and optimizes W to maximize
-    the Poisson log-likelihood: log p(X | W, F).
+    This function uses multiplicative updates for non-negative matrix
+    factorization, which is equivalent to coordinate descent on the
+    Poisson log-likelihood.
+
+    The update rule for W is:
+        W = W * (X @ H) / (W @ (H.T @ H) + eps)
+
+    where H = F (the fixed factors in exp-space).
 
     For uncertainty quantification in F, consider using factor_samples() and
     running this function multiple times with different F samples.
@@ -546,12 +545,12 @@ def transform_W(
     Examples
     --------
     >>> from PNMF import PNMF
-    >>> from PNMF.transforms import transform_W, log_factors
+    >>> from PNMF.transforms import transform_W, get_factors
     >>> # Fit original model
     >>> model = PNMF(n_components=5).fit(X_train)
-    >>> F_log = log_factors(model)
+    >>> F_exp = get_factors(model)  # exp-space factors
     >>> # Learn new W for different data with same factors
-    >>> W_new = transform_W(X_new, F_log)  # Shape: (n_features, 5)
+    >>> W_new = transform_W(X_new, F_exp)  # Shape: (n_features, 5)
     """
     # Determine device
     if device == 'auto':
@@ -564,19 +563,19 @@ def transform_W(
     else:
         device = torch.device(device)
 
-    # Convert inputs to tensors
+    # Convert inputs to tensors on device
     if isinstance(X, np.ndarray):
-        X_np = X
+        X_torch = torch.from_numpy(X.astype(np.float32)).to(device)
     else:
-        X_np = X.detach().cpu().numpy()
+        X_torch = X.to(device).float()
 
     if isinstance(F, np.ndarray):
-        F_np = F
+        F_torch = torch.from_numpy(F.astype(np.float32)).to(device)
     else:
-        F_np = F.detach().cpu().numpy()
+        F_torch = F.to(device).float()
 
-    n_samples, n_features = X_np.shape
-    n_samples_f, L = F_np.shape
+    n_samples, n_features = X_torch.shape
+    n_samples_f, L = F_torch.shape
 
     if n_samples != n_samples_f:
         raise ValueError(f"Sample dimension mismatch: X has {n_samples}, F has {n_samples_f}")
@@ -586,60 +585,49 @@ def transform_W(
     elif n_components != L:
         raise ValueError(f"n_components ({n_components}) does not match F shape ({L})")
 
-    # Convert to torch tensors
-    # X: (N, D) -> (D, N) for internal representation
-    X_torch = torch.from_numpy(X_np.T.astype(np.float32)).to(device)
-    # F: (N, L) -> (L, N) for internal representation
-    F_torch = torch.from_numpy(F_np.T.astype(np.float32)).to(device)
+    # Initialize W: (n_features, n_components)
+    if W_init is not None:
+        if isinstance(W_init, np.ndarray):
+            W = torch.from_numpy(W_init.astype(np.float32)).to(device)
+        else:
+            W = W_init.to(device).float()
+    else:
+        W = torch.rand(n_features, n_components, device=device) * 0.1
 
-    D, N = X_torch.shape
+    # Precompute H.T @ H for multiplicative updates (H = F in our notation)
+    # F: (n_samples, n_components), F.T @ F: (n_components, n_components)
+    with torch.no_grad():
+        FtF = F_torch.T @ F_torch  # (L, L)
 
-    # Initialize W as PositiveParameter
-    W = PositiveParameter((D, L), mode=loadings_mode).to(device)
+        # Training loop with multiplicative updates
+        prev_nll = float('inf')
+        pbar = tqdm(range(max_iter), disable=not verbose, desc="transform_W")
 
-    # Optimizer
-    optimizer = torch.optim.Adam(W.parameters(), lr=learning_rate)
+        for iteration in pbar:
+            # Multiplicative update for W
+            # W = W * (X.T @ F) / (W @ (F.T @ F) + eps)
+            numerator = X_torch.T @ F_torch  # (n_features, n_components)
+            denominator = W @ FtF + 1e-8  # (n_features, n_components)
+            W = W * numerator / denominator
 
-    # Compute exp(F) once since F is fixed
-    F_exp = torch.exp(F_torch)  # (L, N)
+            # Compute NLL for monitoring (Poisson log-likelihood)
+            # rate = F @ W.T -> (n_samples, n_features)
+            rate = F_torch @ W.T  # (n_samples, n_features)
+            log_rate = torch.log(rate.clamp(min=1e-8))
+            nll = -(X_torch * log_rate - rate).sum().item()
 
-    # Training loop - optimize Poisson log-likelihood
-    prev_loss = float('inf')
-    pbar = tqdm(range(max_iter), disable=not verbose, desc="transform_W")
-
-    for iteration in pbar:
-        optimizer.zero_grad()
-
-        # Compute rate: W @ exp(F) -> (D, N)
-        rate = torch.matmul(W.data, F_exp)  # (D, N)
-
-        # Poisson log-likelihood: X * log(rate) - rate - log(X!)
-        # We minimize negative log-likelihood
-        log_rate = torch.log(rate.clamp(min=1e-8))
-        nll = -(X_torch * log_rate - rate).sum()
-
-        # Backward and step
-        nll.backward()
-        optimizer.step()
-
-        # Project if using projected gradient
-        if loadings_mode == 'projected':
-            W.project()
-
-        loss_value = nll.item()
-
-        if verbose:
-            pbar.set_postfix({"NLL": f"{loss_value:.6f}"})
-
-        if abs(loss_value - prev_loss) < tol:
             if verbose:
-                pbar.set_postfix({"NLL": f"{loss_value:.6f}", "status": "converged"})
-                pbar.close()
-            break
+                pbar.set_postfix({"NLL": f"{nll:.6f}"})
 
-        prev_loss = loss_value
+            if abs(nll - prev_nll) < tol:
+                if verbose:
+                    pbar.set_postfix({"NLL": f"{nll:.6f}", "status": "converged"})
+                    pbar.close()
+                break
 
-    return W.data.detach().cpu().numpy()
+            prev_nll = nll
+
+    return W.cpu().numpy()
 
 
 # =============================================================================
