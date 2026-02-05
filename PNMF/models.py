@@ -65,7 +65,8 @@ class PoissonFactorization(nn.Module):
         self.L = L
 
         # Loadings matrix W (D x L) - positive parameters
-        self.W = PositiveParameter((D, L), mode=loadings_mode)
+        # Pass mode (elbo_mode) to PositiveParameter for multiplicative updates
+        self.W = PositiveParameter((D, L), mode=loadings_mode, elbo_mode=mode)
 
     def get_rate(self, prior_samples, idy=None):
         """
@@ -254,6 +255,8 @@ class PNMF:
         self.mode = mode
         self.training_mode = training_mode
         self.E = E
+        if self.mode in ['lower-bound']:
+            self.E = 1
         self.max_iter = max_iter
         self.tol = tol
         self.learning_rate = learning_rate
@@ -281,8 +284,8 @@ class PNMF:
         if self.n_components < 1:
             raise ValueError("n_components must be >= 1")
 
-        if self.loadings_mode not in ['softplus', 'exp', 'projected']:
-            raise ValueError("loadings_mode must be 'softplus', 'exp', or 'projected'")
+        if self.loadings_mode not in ['softplus', 'exp', 'projected', 'multiplicative']:
+            raise ValueError("loadings_mode must be 'softplus', 'exp', 'projected', or 'multiplicative'")
 
         if self.mode not in ['simple', 'expanded', 'lower-bound']:
             raise ValueError("mode must be 'simple', 'expanded', or 'lower-bound'")
@@ -425,6 +428,9 @@ class PNMF:
         ).to(self._get_device())
 
         # Setup optimizers based on training mode
+        # For multiplicative mode, W is updated via multiplicative updates, not gradients
+        use_multiplicative_w = (self.loadings_mode == 'multiplicative')
+
         if self.training_mode == 'natural':
             # Natural gradient mode: dual optimizers
             # NGD for variational parameters (natural params)
@@ -434,21 +440,31 @@ class PNMF:
                 nat_params, num_data=n_samples, lr=self.learning_rate * 0.1
             )
 
-            # Regular optimizer for W parameters
-            W_params = list(self._model.W.parameters())
-            if self.optimizer == 'Adam':
-                self._w_optimizer = torch.optim.Adam(W_params, lr=self.learning_rate)
-            elif self.optimizer == 'AdamW':
-                self._w_optimizer = torch.optim.AdamW(W_params, lr=self.learning_rate)
-            elif self.optimizer == 'NAdam':
-                self._w_optimizer = torch.optim.NAdam(W_params, lr=self.learning_rate)
-            elif self.optimizer == 'SGD':
-                self._w_optimizer = torch.optim.SGD(W_params, lr=self.learning_rate, momentum=0.9)
-            elif self.optimizer == 'RMSprop':
-                self._w_optimizer = torch.optim.RMSprop(W_params, lr=self.learning_rate)
+            if use_multiplicative_w:
+                # W uses multiplicative updates, no optimizer needed
+                self._w_optimizer = None
+            else:
+                # Regular optimizer for W parameters
+                W_params = list(self._model.W.parameters())
+                if self.optimizer == 'Adam':
+                    self._w_optimizer = torch.optim.Adam(W_params, lr=self.learning_rate)
+                elif self.optimizer == 'AdamW':
+                    self._w_optimizer = torch.optim.AdamW(W_params, lr=self.learning_rate)
+                elif self.optimizer == 'NAdam':
+                    self._w_optimizer = torch.optim.NAdam(W_params, lr=self.learning_rate)
+                elif self.optimizer == 'SGD':
+                    self._w_optimizer = torch.optim.SGD(W_params, lr=self.learning_rate, momentum=0.9)
+                elif self.optimizer == 'RMSprop':
+                    self._w_optimizer = torch.optim.RMSprop(W_params, lr=self.learning_rate)
         else:
-            # Standard mode: single optimizer for all parameters
-            params = list(self._model.W.parameters()) + list(self._prior.parameters())
+            # Standard mode
+            if use_multiplicative_w:
+                # Only optimize variational parameters, W uses multiplicative updates
+                params = list(self._prior.parameters())
+            else:
+                # Optimize all parameters
+                params = list(self._model.W.parameters()) + list(self._prior.parameters())
+
             if self.optimizer == 'Adam':
                 self._optimizer = torch.optim.Adam(params, lr=self.learning_rate)
             elif self.optimizer == 'AdamW':
@@ -517,20 +533,32 @@ class PNMF:
             if self.batch_size is not None:
                 loss = loss * (N / min(self.batch_size, N))
 
-            # Backward pass
+            # Backward pass (for variational parameters)
             loss.backward()
 
-            # Step optimizers
+            # Step optimizers for variational parameters
             if self.training_mode == 'natural':
-                # Natural gradient mode: step both optimizers
-                self._optimizer.step()  # NGD for variational parameters
-                self._w_optimizer.step()  # Adam for W parameters
+                # Natural gradient mode: step NGD for variational parameters
+                self._optimizer.step()
+                if self._w_optimizer is not None:
+                    self._w_optimizer.step()  # Adam for W parameters (if not multiplicative)
             else:
                 # Standard mode: single optimizer
                 self._optimizer.step()
 
-            # Project parameters if using projected gradient
-            if self.loadings_mode == 'projected':
+            # Handle W updates based on loadings_mode
+            if self.loadings_mode == 'multiplicative':
+                # For lower-bound mode, no samples needed (fully analytic)
+                # For expanded/simple, we need F samples
+                if self.mode == 'lower-bound':
+                    self._model.W.multiplicative_update(X_batch, qF, idy=idy)
+                else:
+                    # Get F samples for multiplicative update (use same E as forward pass)
+                    # We need to re-sample since the forward pass samples are not stored
+                    F_samples = qF.rsample((self.E,))  # (E, L, N)
+                    self._model.W.multiplicative_update(X_batch, qF, F_samples, idy=idy)
+            elif self.loadings_mode == 'projected':
+                # Project parameters if using projected gradient
                 self._model.project_parameters()
 
             # Check convergence (using scaled loss for batched mode)

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from abc import abstractmethod
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 
 
 class NaturalToMuS(torch.autograd.Function):
@@ -287,22 +287,48 @@ class PositiveParameter(ConstrainedParameter):
 
     Args:
         shape: int or tuple for the parameter shape.
-        mode: 'softplus', 'exp', or 'projected' for ensuring positivity.
+        mode: 'softplus', 'exp', 'projected', or 'multiplicative' for ensuring positivity.
+        elbo_mode: ELBO computation mode for multiplicative updates. Only used when
+            mode='multiplicative'. One of 'lower-bound', 'expanded', or 'simple'.
 
     The mode determines how positivity is enforced:
         - 'softplus': Uses softplus(x) = log(1 + exp(x)) transformation
         - 'exp': Uses exp(x) transformation
         - 'projected': Uses projected gradient descent (clamps to >= 0 after each step)
+        - 'multiplicative': Uses multiplicative updates (no gradient-based optimization).
+            Requires calling multiplicative_update() manually after computing update terms.
+
+    For multiplicative mode, the update rule is:
+        W = W * numerator / denominator
+
+    The numerator and denominator depend on the elbo_mode:
+        - 'lower-bound': Fully analytic using Jensen's bound
+        - 'expanded': Hybrid MC + analytic expectation
+        - 'simple': Full Monte Carlo
     """
 
-    def __init__(self, shape: Union[int, Tuple[int, ...]], mode: str = 'softplus'):
-        if mode not in ['softplus', 'exp', 'projected']:
-            raise ValueError(f"Unknown mode: {mode}. Choose 'softplus', 'exp', or 'projected'")
+    def __init__(
+        self,
+        shape: Union[int, Tuple[int, ...]],
+        mode: str = 'softplus',
+        elbo_mode: str = 'expanded'
+    ):
+        if mode not in ['softplus', 'exp', 'projected', 'multiplicative']:
+            raise ValueError(
+                f"Unknown mode: {mode}. Choose 'softplus', 'exp', 'projected', or 'multiplicative'"
+            )
+        if mode == 'multiplicative' and elbo_mode not in ['lower-bound', 'expanded', 'simple']:
+            raise ValueError(
+                f"Unknown elbo_mode: {elbo_mode}. Choose 'lower-bound', 'expanded', or 'simple'"
+            )
         super().__init__(shape, mode)
-        self._raw = nn.Parameter(self._init_raw())
+        self.elbo_mode = elbo_mode
+        # For multiplicative mode, we don't need gradients (updated via multiplicative_update)
+        requires_grad = (mode != 'multiplicative')
+        self._raw = nn.Parameter(self._init_raw(), requires_grad=requires_grad)
 
     def _init_raw(self) -> torch.Tensor:
-        if self.mode == 'projected':
+        if self.mode in ['projected', 'multiplicative']:
             return torch.rand(self._shape)
         else:
             return torch.randn(self._shape)
@@ -312,7 +338,7 @@ class PositiveParameter(ConstrainedParameter):
             return F.softplus(raw)
         elif self.mode == 'exp':
             return torch.exp(raw)
-        else:  # projected
+        else:  # projected or multiplicative
             return raw
 
     def _to_unconstrained(self, constrained: torch.Tensor) -> torch.Tensor:
@@ -321,7 +347,7 @@ class PositiveParameter(ConstrainedParameter):
             return torch.log(torch.exp(constrained) - 1)
         elif self.mode == 'exp':
             return torch.log(constrained)
-        else:  # projected
+        else:  # projected or multiplicative
             return constrained.clamp(min=0.0)
 
     def project(self):
@@ -335,6 +361,105 @@ class PositiveParameter(ConstrainedParameter):
             with torch.no_grad():
                 self._raw.data.clamp_(min=0.0)
 
+    def multiplicative_update(
+        self,
+        X: torch.Tensor,
+        qF: torch.distributions.Distribution,
+        F_samples: Optional[torch.Tensor] = None,
+        idy: Optional[torch.Tensor] = None,
+        eps: float = 1e-8
+    ):
+        """
+        Perform multiplicative update for W based on ELBO mode.
+
+        This implements the update rule:
+            W_jl <- W_jl * numerator_jl / denominator_jl
+
+        The formulas depend on elbo_mode:
+        - 'lower-bound': Fully analytic using Jensen's bound (no samples needed)
+            numerator = sum_i (Y_ij / R_ij^mu) * exp(mu_il)
+            denominator = sum_i exp(mu_il + sigma_il^2 / 2)
+        - 'expanded': Hybrid MC + analytic expectation
+            numerator = (1/S) * sum_s sum_i (Y_ij / R_ij^s) * exp(F_il^s)
+            denominator = sum_i exp(mu_il + sigma_il^2 / 2)
+        - 'simple': Full Monte Carlo
+            numerator = sum_s sum_i (Y_ij / R_ij^s) * exp(F_il^s)
+            denominator = sum_s sum_i exp(F_il^s)
+
+        Args:
+            X: Data tensor of shape (D, N) or (D_batch, N) where D is features,
+                N is samples. If idy is provided, X should be the batched data
+                with shape (D_batch, N).
+            qF: Variational distribution for F.
+            F_samples: Samples from qF of shape (E, L, N) where E is number
+                of samples, L is components. Required for 'expanded' and 'simple'
+                modes, ignored for 'lower-bound' mode.
+            idy: Optional feature indices for batched updates. If provided, only
+                updates W[idy] (the rows specified by idy). Shape: (D_batch,).
+            eps: Small constant for numerical stability.
+
+        Notes:
+            - W has shape (D, L) where D is features, L is components
+            - This should only be called when mode='multiplicative'
+            - Gradient computation is disabled during this update
+            - When idy is provided, this enables feature batching (y_batch_size)
+        """
+        if self.mode != 'multiplicative':
+            raise ValueError(
+                f"multiplicative_update() requires mode='multiplicative', got mode='{self.mode}'"
+            )
+
+        if self.elbo_mode in ['expanded', 'simple'] and F_samples is None:
+            raise ValueError(f"F_samples is required for elbo_mode='{self.elbo_mode}'")
+
+        with torch.no_grad():
+            # Get W (full or batched)
+            W_full = self._raw  # (D, L)
+            W = W_full[idy] if idy is not None else W_full  # (D_batch, L) or (D, L)
+
+            mu = qF.mean  # (L, N)
+            sigma_sq = qF.stddev ** 2  # (L, N)
+
+            # Shared computation: E[exp(F)] = exp(mu + sigma^2/2)
+            exp_mu_sigma = torch.exp(mu + 0.5 * sigma_sq)  # (L, N)
+
+            if self.elbo_mode == 'lower-bound':
+                # Fully analytic - use exp(mu) for reconstruction
+                exp_mu = torch.exp(mu)  # (L, N)
+                rate = torch.matmul(W, exp_mu)  # (D_batch, N)
+                ratio = X / (rate + eps)  # (D_batch, N)
+                numerator = torch.matmul(ratio, exp_mu.T)  # (D_batch, L)
+                denominator = exp_mu_sigma.sum(dim=1)  # (L,)
+
+            else:
+                # Monte Carlo modes - use samples for reconstruction
+                exp_F = torch.exp(F_samples)  # (E, L, N)
+                rate = torch.matmul(W, exp_F)  # (E, D_batch, N)
+                ratio = X.unsqueeze(0) / (rate + eps)  # (E, D_batch, N)
+
+                # numerator: ratio @ exp_F^T, summed/averaged over samples
+                # (E, D_batch, N) @ (E, N, L) -> (E, D_batch, L) via batched matmul
+                numerator_per_sample = torch.bmm(ratio, exp_F.permute(0, 2, 1))  # (E, D_batch, L)
+
+                if self.elbo_mode == 'expanded':
+                    numerator = numerator_per_sample.mean(dim=0)  # (D_batch, L)
+                    denominator = exp_mu_sigma.sum(dim=1)  # (L,) - analytic
+                else:  # simple
+                    numerator = numerator_per_sample.sum(dim=0)  # (D_batch, L)
+                    denominator = exp_F.sum(dim=(0, 2))  # (L,) - MC estimate
+
+            # Apply multiplicative update: W <- W * num / denom
+            # denominator is (L,), broadcast to (D_batch, L)
+            updated_W = W * numerator / (denominator + eps)
+            updated_W.clamp_(min=eps)
+
+            # Update the appropriate rows of W
+            if idy is not None:
+                self._raw.data[idy] = updated_W
+            else:
+                self._raw.data = updated_W
+
     def __repr__(self):
         grad_str = ", requires_grad=True" if self._raw.requires_grad else ""
-        return f"PositiveParameter(shape={self._shape}, mode='{self.mode}'{grad_str})"
+        elbo_str = f", elbo_mode='{self.elbo_mode}'" if self.mode == 'multiplicative' else ""
+        return f"PositiveParameter(shape={self._shape}, mode='{self.mode}'{elbo_str}{grad_str})"
