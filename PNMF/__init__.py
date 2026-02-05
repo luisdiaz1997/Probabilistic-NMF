@@ -19,6 +19,10 @@ For PyTorch-native usage:
 Transform and utility functions:
     >>> from PNMF import log_factors, factors, factor_uncertainty
     >>> from PNMF import transform_F, transform_W, get_loadings
+
+Initialization functions:
+    >>> from PNMF import initialize_factors
+    >>> W, exp_F = initialize_factors(X, n_components=5, init='nndsvda')
 """
 
 __version__ = "0.1.0"
@@ -30,6 +34,7 @@ from .elbo import (
     expected_log_likelihood,
     kl_divergence,
 )
+from .initialization import initialize_factors
 from .transforms import (
     # Factor extraction
     log_factors,
@@ -57,6 +62,8 @@ __all__ = [
     "compute_elbo",
     "expected_log_likelihood",
     "kl_divergence",
+    # Initialization
+    "initialize_factors",
     # Factor extraction
     "log_factors",
     "get_factors",

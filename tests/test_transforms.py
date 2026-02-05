@@ -46,7 +46,7 @@ def generate_small_count_data(seed=42):
 def fitted_model():
     """Create a fitted PNMF model for testing."""
     X = generate_small_count_data()
-    model = PNMF(n_components=5, max_iter=20, random_state=42)
+    model = PNMF(n_components=5, max_iter=20, random_state=42, init='random')
     model.fit(X)
     return model, X
 
@@ -55,7 +55,7 @@ def fitted_model():
 def fitted_model_natural():
     """Create a fitted PNMF model with natural gradients for testing."""
     X = generate_small_count_data()
-    model = PNMF(n_components=5, max_iter=20, random_state=42, training_mode='natural')
+    model = PNMF(n_components=5, max_iter=20, random_state=42, training_mode='natural', init='random')
     model.fit(X)
     return model, X
 
@@ -504,8 +504,9 @@ class TestIntegration:
         sample_mean = samples.mean(axis=0)
         # E[exp(F)] ≈ exp(μ + σ²/2) for large number of samples
         expected_mean = get_factors(model, use_mgf=True)
-        # Relaxed tolerance for stochastic comparison
-        np.testing.assert_array_almost_equal(sample_mean, expected_mean, decimal=0)
+        # Use relative tolerance since values can have different magnitudes
+        # 1% relative tolerance is reasonable for Monte Carlo sampling
+        np.testing.assert_allclose(sample_mean, expected_mean, rtol=0.01, atol=0.5)
 
 
 # =============================================================================

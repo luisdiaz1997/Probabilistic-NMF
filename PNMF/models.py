@@ -16,6 +16,7 @@ from .custom_modules import PositiveParameter
 from .elbo import compute_elbo
 from .optimizers import NaturalGradientDescent
 from .priors import GaussianPrior
+from . import initialization
 
 
 class PoissonFactorization(nn.Module):
@@ -187,6 +188,16 @@ class PNMF:
         Device to use for computation. 'auto' will select mps (Apple Silicon),
         cuda (NVIDIA), or cpu in that order based on availability.
 
+    init : {None, 'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means'}, default=None
+        Initialization method for W and exp(F):
+        - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
+          otherwise 'random'.
+        - 'random': Non-negative random matrices, scaled with sqrt(X.mean() / n_components).
+        - 'nndsvd': Nonnegative Double SVD (better for sparseness).
+        - 'nndsvda': NNDSVD with zeros filled with average of X (better for dense data).
+        - 'nndsvdar': NNDSVD with zeros filled with small random values (faster dense).
+        - 'k-means': K-means clustering based initialization.
+
     batch_size : int, default=None
         Size of mini-batches for samples (N dimension). If None, uses full batch.
         Enable mini-batch training for large datasets.
@@ -246,6 +257,7 @@ class PNMF:
         random_state: Optional[int] = None,
         verbose: bool = False,
         device: str = 'auto',
+        init: Optional[str] = None,
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
         shuffle: bool = True
@@ -264,6 +276,7 @@ class PNMF:
         self.random_state = random_state
         self.verbose = verbose
         self.device = device
+        self.init = init
         self.batch_size = batch_size
         self.y_batch_size = y_batch_size
         self.shuffle = shuffle
@@ -307,6 +320,12 @@ class PNMF:
 
         if self.optimizer not in ['Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop']:
             raise ValueError("optimizer must be 'Adam', 'AdamW', 'NAdam', 'SGD', or 'RMSprop'")
+
+        valid_init_options = [None, 'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means']
+        if self.init not in valid_init_options:
+            raise ValueError(
+                f"init must be one of {valid_init_options}, got '{self.init}'"
+            )
 
         if self.batch_size is not None and self.batch_size < 1:
             raise ValueError("batch_size must be >= 1 or None")
@@ -363,6 +382,63 @@ class PNMF:
             idy = None
 
         return idx, idy
+
+    def _initialize_parameters(self, X_torch: torch.Tensor):
+        """
+        Initialize W and variational parameters using specified init method.
+
+        Parameters
+        ----------
+        X_torch : torch.Tensor of shape (D, N)
+            Input data tensor (transposed: features x samples).
+
+        Notes
+        -----
+        This method initializes:
+        - W (loadings matrix) via PositiveParameter
+        - GaussianPrior mean (μ) based on log of initialized exp(F)
+        - GaussianPrior scale (σ) to a small default value
+        """
+        # Convert back to numpy for initialization (transpose to sklearn format)
+        X_np = X_torch.T.cpu().numpy()  # (N, D)
+
+        # Get initializations
+        W_init, exp_F_init = initialization.initialize_factors(
+            X_np, self.n_components, self.init, self.random_state
+        )
+
+        # Initialize W (loadings) - shape (D, L)
+        # W_init is (D, L), which matches our internal W shape
+        self._model.W.data = torch.from_numpy(W_init.astype(np.float32)).to(self._get_device())
+
+        # Initialize variational mean (μ)
+        # F is in log-space, so μ = log(exp_F) = log(initial value)
+        # Need to handle zeros: log(exp_F + eps)
+        eps = 1e-8
+        log_F_init = np.log(exp_F_init + eps)  # (N, L) -> need (L, N)
+        mu_init = log_F_init.T  # (L, N)
+
+        if self.training_mode == 'natural':
+            # Natural parameterization: θ₁ = μ/s², θ₂ = -1/(2s²)
+            # Initialize s² = 0.1 (small uncertainty), so:
+            # θ₁ = μ / 0.1 = 10 * μ
+            # θ₂ = -1/(2 * 0.1) = -5
+            s2_init = 0.1
+            self._prior.theta1.data = torch.from_numpy(
+                (mu_init / s2_init).astype(np.float32)
+            ).to(self._get_device())
+            self._prior.theta2.data.fill_(-1.0 / (2.0 * s2_init))
+        else:
+            # Standard parameterization
+            self._prior.mean.data = torch.from_numpy(
+                mu_init.astype(np.float32)
+            ).to(self._get_device())
+
+            # Initialize scale to small value (we're fairly confident in initialization)
+            # For softplus mode: raw parameter such that softplus(raw) ≈ 0.1
+            # softplus(x) ≈ 0.1 when x ≈ -2.2
+            if hasattr(self._prior.scale, '_raw'):
+                self._prior.scale._raw.data.fill_(-2.2)
 
     def fit(
         self,
@@ -426,6 +502,9 @@ class PNMF:
             loadings_mode=self.loadings_mode,
             mode=self.mode
         ).to(self._get_device())
+
+        # Apply custom initialization
+        self._initialize_parameters(X_torch)
 
         # Setup optimizers based on training mode
         # For multiplicative mode, W is updated via multiplicative updates, not gradients
