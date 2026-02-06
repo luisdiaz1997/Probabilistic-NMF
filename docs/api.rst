@@ -11,6 +11,11 @@ Main Interface
    :undoc-members:
    :show-inheritance:
 
+Initialization
+--------------
+
+.. autofunction:: PNMF.initialization.initialize_factors
+
 Transform and Utility Functions
 -------------------------------
 

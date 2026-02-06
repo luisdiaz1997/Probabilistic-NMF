@@ -13,9 +13,10 @@ from typing import Optional, Union
 from tqdm.auto import tqdm
 
 from .custom_modules import PositiveParameter
-from .elbo import compute_elbo
+from .elbo import compute_elbo, compute_log_likelihood_terms
 from .optimizers import NaturalGradientDescent
 from .priors import GaussianPrior
+from . import initialization
 
 
 class PoissonFactorization(nn.Module):
@@ -87,9 +88,9 @@ class PoissonFactorization(nn.Module):
         Z = torch.matmul(W, F)  # shape (E, D, N)
         return Z
 
-    def forward(self, idx=None, idy=None, E=10):
+    def forward(self, idx=None, idy=None, E=10, X=None):
         """
-        Forward pass generating Poisson rate.
+        Forward pass: compute variational distributions and log-likelihood terms.
 
         Supports both full-batch and mini-batch training. When idx and idy are
         None, performs full-batch forward pass. Otherwise, computes on the
@@ -98,10 +99,13 @@ class PoissonFactorization(nn.Module):
         Args:
             idx: Sample indices (for N dimension), None for full samples
             idy: Feature indices (for D dimension), None for full features
-            E: Number of Monte Carlo samples for variational inference
+            E: Number of Monte Carlo samples (ignored for lower-bound mode)
+            X: Input data (D, N) or (D_batch, N_batch). Required for
+               memory-efficient MC accumulation. If None and MC is needed,
+               falls back to full-tensor mode.
 
         Returns:
-            rate: Poisson rate tensor of shape (E, D_batch, N_batch)
+            terms: dict from compute_log_likelihood_terms()
             qF: Variational posterior distribution (batched if idx provided)
             pF: Prior distribution (batched if idx provided)
         """
@@ -111,13 +115,19 @@ class PoissonFactorization(nn.Module):
         else:
             qF, pF = self.prior()
 
-        # Sample F using reparameterization trick: shape (E, L, batch_size)
-        F = qF.rsample((E,))
+        # Get W (optionally batched on features)
+        W = self.W.data
+        if idy is not None:
+            W = W[idy]
 
-        # Compute rate using get_rate (F is the prior samples, not exp(F))
-        rate = self.get_rate(F, idy=idy)  # shape (E, D, N)
+        # Compute all log-likelihood terms
+        # Multiplicative W needs the same MC samples for its update rule
+        terms = compute_log_likelihood_terms(
+            W=W, qF=qF, X=X, E=E, mode=self.mode,
+            return_samples=(self.loadings_mode == 'multiplicative'),
+        )
 
-        return rate, qF, pF
+        return terms, qF, pF
 
     def project_parameters(self):
         """Apply projection to ensure non-negativity (for projected gradient mode)."""
@@ -187,6 +197,16 @@ class PNMF:
         Device to use for computation. 'auto' will select mps (Apple Silicon),
         cuda (NVIDIA), or cpu in that order based on availability.
 
+    init : {'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means', None}, default='random'
+        Initialization method for W and exp(F):
+        - 'random': Non-negative random matrices, scaled with sqrt(X.mean() / n_components) (default).
+        - 'nndsvd': Nonnegative Double SVD (better for sparseness).
+        - 'nndsvda': NNDSVD with zeros filled with average of X (better for dense data).
+        - 'nndsvdar': NNDSVD with zeros filled with small random values (faster dense).
+        - 'k-means': K-means clustering based initialization.
+        - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
+          otherwise 'random'.
+
     batch_size : int, default=None
         Size of mini-batches for samples (N dimension). If None, uses full batch.
         Enable mini-batch training for large datasets.
@@ -246,6 +266,7 @@ class PNMF:
         random_state: Optional[int] = None,
         verbose: bool = False,
         device: str = 'auto',
+        init: Optional[str] = 'random',
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
         shuffle: bool = True
@@ -264,6 +285,7 @@ class PNMF:
         self.random_state = random_state
         self.verbose = verbose
         self.device = device
+        self.init = init
         self.batch_size = batch_size
         self.y_batch_size = y_batch_size
         self.shuffle = shuffle
@@ -307,6 +329,12 @@ class PNMF:
 
         if self.optimizer not in ['Adam', 'AdamW', 'NAdam', 'SGD', 'RMSprop']:
             raise ValueError("optimizer must be 'Adam', 'AdamW', 'NAdam', 'SGD', or 'RMSprop'")
+
+        valid_init_options = [None, 'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means']
+        if self.init not in valid_init_options:
+            raise ValueError(
+                f"init must be one of {valid_init_options}, got '{self.init}'"
+            )
 
         if self.batch_size is not None and self.batch_size < 1:
             raise ValueError("batch_size must be >= 1 or None")
@@ -363,6 +391,63 @@ class PNMF:
             idy = None
 
         return idx, idy
+
+    def _initialize_parameters(self, X_torch: torch.Tensor):
+        """
+        Initialize W and variational parameters using specified init method.
+
+        Parameters
+        ----------
+        X_torch : torch.Tensor of shape (D, N)
+            Input data tensor (transposed: features x samples).
+
+        Notes
+        -----
+        This method initializes:
+        - W (loadings matrix) via PositiveParameter
+        - GaussianPrior mean (μ) based on log of initialized exp(F)
+        - GaussianPrior scale (σ) to a small default value
+        """
+        # Convert back to numpy for initialization (transpose to sklearn format)
+        X_np = X_torch.T.cpu().numpy()  # (N, D)
+
+        # Get initializations
+        W_init, exp_F_init = initialization.initialize_factors(
+            X_np, self.n_components, self.init, self.random_state
+        )
+
+        # Initialize W (loadings) - shape (D, L)
+        # W_init is (D, L), which matches our internal W shape
+        self._model.W.data = torch.from_numpy(W_init.astype(np.float32)).to(self._get_device())
+
+        # Initialize variational mean (μ)
+        # F is in log-space, so μ = log(exp_F) = log(initial value)
+        # Need to handle zeros: log(exp_F + eps)
+        eps = 1e-8
+        log_F_init = np.log(exp_F_init + eps)  # (N, L) -> need (L, N)
+        mu_init = log_F_init.T  # (L, N)
+
+        if self.training_mode == 'natural':
+            # Natural parameterization: θ₁ = μ/s², θ₂ = -1/(2s²)
+            # Initialize s² = 0.1 (small uncertainty), so:
+            # θ₁ = μ / 0.1 = 10 * μ
+            # θ₂ = -1/(2 * 0.1) = -5
+            s2_init = 0.1
+            self._prior.theta1.data = torch.from_numpy(
+                (mu_init / s2_init).astype(np.float32)
+            ).to(self._get_device())
+            self._prior.theta2.data.fill_(-1.0 / (2.0 * s2_init))
+        else:
+            # Standard parameterization
+            self._prior.mean.data = torch.from_numpy(
+                mu_init.astype(np.float32)
+            ).to(self._get_device())
+
+            # Initialize scale to small value (we're fairly confident in initialization)
+            # For softplus mode: raw parameter such that softplus(raw) ≈ 0.1
+            # softplus(x) ≈ 0.1 when x ≈ -2.2
+            if hasattr(self._prior.scale, '_raw'):
+                self._prior.scale._raw.data.fill_(-2.2)
 
     def fit(
         self,
@@ -426,6 +511,9 @@ class PNMF:
             loadings_mode=self.loadings_mode,
             mode=self.mode
         ).to(self._get_device())
+
+        # Apply custom initialization
+        self._initialize_parameters(X_torch)
 
         # Setup optimizers based on training mode
         # For multiplicative mode, W is updated via multiplicative updates, not gradients
@@ -516,22 +604,27 @@ class PNMF:
             else:
                 X_batch = X_torch
 
-            # Forward pass (handles both batched and full modes)
-            rate, qF, pF = self._model.forward(idx, idy, E=self.E)
+            # Forward pass — terms contains all precomputed log-likelihood intermediates
+            terms, qF, pF = self._model.forward(idx, idy, E=self.E, X=X_batch)
 
-            # Get W (optionally batched)
-            W = self._model.W.data
-            if idy is not None:
-                W = W[idy]
+            # Compute expected log-likelihood and KL separately
+            exp_ll, kl = compute_elbo(self.mode, terms, qF, pF, X_batch)
 
-            # Compute ELBO loss
-            loss = compute_elbo(self.mode, rate, qF, pF, X_batch, W)
-
-            # Scale ELBO for mini-batch
+            # Scale expected log-likelihood for feature mini-batch
             if self.y_batch_size is not None:
-                loss = loss * (D / min(self.y_batch_size, D))
+                exp_ll = exp_ll * (D / min(self.y_batch_size, D))
+
+            # Scale expected log-likelihood for sample mini-batch
             if self.batch_size is not None:
-                loss = loss * (N / min(self.batch_size, N))
+                exp_ll = exp_ll * (N / min(self.batch_size, N))
+
+            # Scale KL for sample mini-batch
+            # (KL is over batched q(F) so it needs N-scaling)
+            if self.batch_size is not None:
+                kl = kl * (N / min(self.batch_size, N))
+
+            # Loss = -ELBO = KL - E[log p(X|F)]
+            loss = kl - exp_ll
 
             # Backward pass (for variational parameters)
             loss.backward()
@@ -548,15 +641,7 @@ class PNMF:
 
             # Handle W updates based on loadings_mode
             if self.loadings_mode == 'multiplicative':
-                # For lower-bound mode, no samples needed (fully analytic)
-                # For expanded/simple, we need F samples
-                if self.mode == 'lower-bound':
-                    self._model.W.multiplicative_update(X_batch, qF, idy=idy)
-                else:
-                    # Get F samples for multiplicative update (use same E as forward pass)
-                    # We need to re-sample since the forward pass samples are not stored
-                    F_samples = qF.rsample((self.E,))  # (E, L, N)
-                    self._model.W.multiplicative_update(X_batch, qF, F_samples, idy=idy)
+                self._model.W.multiplicative_update(X_batch, terms, idy=idy)
             elif self.loadings_mode == 'projected':
                 # Project parameters if using projected gradient
                 self._model.project_parameters()

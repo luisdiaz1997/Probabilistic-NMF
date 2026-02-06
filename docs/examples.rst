@@ -27,6 +27,53 @@ Basic Usage
    print(f"Final ELBO: {model.elbo_}")             # Evidence Lower Bound
    print(f"Iterations: {model.n_iter_}")           # Number of iterations
 
+Initialization Methods
+----------------------
+
+Different initialization strategies can significantly affect convergence speed and final model quality:
+
+.. code-block:: python
+
+   from PNMF import PNMF
+   import numpy as np
+
+   X = np.random.poisson(5, size=(100, 50)).astype(np.float32)
+
+   # Random initialization (simple baseline)
+   model_random = PNMF(n_components=5, init='random', random_state=42)
+
+   # NNDSVD initialization (sparse, good for sparse data)
+   model_nndsvd = PNMF(n_components=5, init='nndsvd', random_state=42)
+
+   # NNDSVD with average fill (dense, recommended for most cases)
+   model_nndsvda = PNMF(n_components=5, init='nndsvda', random_state=42)
+
+   # NNDSVD with random fill (faster dense alternative)
+   model_nndsvdar = PNMF(n_components=5, init='nndsvdar', random_state=42)
+
+   # K-means clustering initialization
+   model_kmeans = PNMF(n_components=5, init='k-means', random_state=42)
+
+   # Auto initialization (None): uses 'nndsvda' if n_components <= min(n_samples, n_features)
+   # otherwise falls back to 'random'
+   model_auto = PNMF(n_components=5, init=None, random_state=42)
+
+   # Fit and compare
+   model_random.fit(X)
+   model_nndsvda.fit(X)
+
+   print(f"Random init ELBO: {model_random.elbo_:.2f}")
+   print(f"NNDSVDa init ELBO: {model_nndsvda.elbo_:.2f}")
+
+The available initialization methods are:
+
+- ``None`` (default): Auto-select 'nndsvda' if n_components <= min(n_samples, n_features), otherwise 'random'
+- ``'random'``: Non-negative random matrices, scaled with ``sqrt(X.mean() / n_components)``
+- ``'nndsvd'``: Nonnegative Double SVD - produces sparse results, best for sparse factorization
+- ``'nndsvda'``: NNDSVD with zeros filled with average of X - dense factorization, recommended for most cases
+- ``'nndsvdar'``: NNDSVD with zeros filled with small random values - faster dense alternative
+- ``'k-means'``: K-means clustering based initialization - good for clustered data
+
 Using Different Loadings Modes
 -------------------------------
 

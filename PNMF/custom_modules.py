@@ -364,96 +364,77 @@ class PositiveParameter(ConstrainedParameter):
     def multiplicative_update(
         self,
         X: torch.Tensor,
-        qF: torch.distributions.Distribution,
-        F_samples: Optional[torch.Tensor] = None,
+        terms: dict,
         idy: Optional[torch.Tensor] = None,
         eps: float = 1e-8
     ):
         """
-        Perform multiplicative update for W based on ELBO mode.
+        Perform multiplicative update for W using precomputed terms.
 
-        This implements the update rule:
-            W_jl <- W_jl * numerator_jl / denominator_jl
+        Reuses all tensors already computed by compute_log_likelihood_terms():
+        - exp_mu, exp_mu_sigma (always available)
+        - rate_mean (lower-bound: W @ exp(μ), already computed)
+        - exp_F_samples (MC modes: collected during the loop)
 
-        The formulas depend on elbo_mode:
-        - 'lower-bound': Fully analytic using Jensen's bound (no samples needed)
-            numerator = sum_i (Y_ij / R_ij^mu) * exp(mu_il)
-            denominator = sum_i exp(mu_il + sigma_il^2 / 2)
-        - 'expanded': Hybrid MC + analytic expectation
-            numerator = (1/S) * sum_s sum_i (Y_ij / R_ij^s) * exp(F_il^s)
-            denominator = sum_i exp(mu_il + sigma_il^2 / 2)
-        - 'simple': Full Monte Carlo
-            numerator = sum_s sum_i (Y_ij / R_ij^s) * exp(F_il^s)
-            denominator = sum_s sum_i exp(F_il^s)
+        For MC modes, rate_e = W @ exp_F_e is computed per-sample in a loop
+        under no_grad, avoiding the (E, D, N) batch matmul entirely.
+
+        Update rule:  W_jl <- W_jl * numerator_jl / denominator_jl
 
         Args:
-            X: Data tensor of shape (D, N) or (D_batch, N) where D is features,
-                N is samples. If idy is provided, X should be the batched data
-                with shape (D_batch, N).
-            qF: Variational distribution for F.
-            F_samples: Samples from qF of shape (E, L, N) where E is number
-                of samples, L is components. Required for 'expanded' and 'simple'
-                modes, ignored for 'lower-bound' mode.
-            idy: Optional feature indices for batched updates. If provided, only
-                updates W[idy] (the rows specified by idy). Shape: (D_batch,).
+            X: Data tensor of shape (D, N) or (D_batch, N).
+            terms: dict from compute_log_likelihood_terms(return_samples=True).
+                Required keys depend on elbo_mode:
+                - All modes: 'exp_mu', 'exp_mu_sigma'
+                - 'lower-bound': 'rate_mean'
+                - 'expanded'/'simple': 'exp_F_samples'
+            idy: Optional feature indices for batched updates. Shape: (D_batch,).
             eps: Small constant for numerical stability.
-
-        Notes:
-            - W has shape (D, L) where D is features, L is components
-            - This should only be called when mode='multiplicative'
-            - Gradient computation is disabled during this update
-            - When idy is provided, this enables feature batching (y_batch_size)
         """
         if self.mode != 'multiplicative':
             raise ValueError(
                 f"multiplicative_update() requires mode='multiplicative', got mode='{self.mode}'"
             )
 
-        if self.elbo_mode in ['expanded', 'simple'] and F_samples is None:
-            raise ValueError(f"F_samples is required for elbo_mode='{self.elbo_mode}'")
-
         with torch.no_grad():
             # Get W (full or batched)
             W_full = self._raw  # (D, L)
             W = W_full[idy] if idy is not None else W_full  # (D_batch, L) or (D, L)
 
-            mu = qF.mean  # (L, N)
-            sigma_sq = qF.stddev ** 2  # (L, N)
-
-            # Shared computation: E[exp(F)] = exp(mu + sigma^2/2)
-            exp_mu_sigma = torch.exp(mu + 0.5 * sigma_sq)  # (L, N)
-
             if self.elbo_mode == 'lower-bound':
-                # Fully analytic - use exp(mu) for reconstruction
-                exp_mu = torch.exp(mu)  # (L, N)
-                rate = torch.matmul(W, exp_mu)  # (D_batch, N)
-                ratio = X / (rate + eps)  # (D_batch, N)
-                numerator = torch.matmul(ratio, exp_mu.T)  # (D_batch, L)
-                denominator = exp_mu_sigma.sum(dim=1)  # (L,)
+                exp_mu = terms['exp_mu']                          # (L, N)
+                rate = terms['rate_mean']                          # (D_batch, N)
+                ratio = X / (rate + eps)                           # (D_batch, N)
+                numerator = torch.matmul(ratio, exp_mu.T)          # (D_batch, L)
+                denominator = terms['exp_mu_sigma'].sum(dim=1)     # (L,)
 
             else:
-                # Monte Carlo modes - use samples for reconstruction
-                exp_F = torch.exp(F_samples)  # (E, L, N)
-                rate = torch.matmul(W, exp_F)  # (E, D_batch, N)
-                ratio = X.unsqueeze(0) / (rate + eps)  # (E, D_batch, N)
+                # MC modes — loop over samples to avoid (E, D_batch, N) tensors
+                exp_F = terms['exp_F_samples']                     # (E, L, N)
+                E_samples = exp_F.shape[0]
+                D_batch = W.shape[0]
+                L = W.shape[1]
+                numerator = torch.zeros(D_batch, L, dtype=X.dtype, device=X.device)
+                denominator_acc = torch.zeros(L, dtype=X.dtype, device=X.device) if self.elbo_mode == 'simple' else None
 
-                # numerator: ratio @ exp_F^T, summed/averaged over samples
-                # (E, D_batch, N) @ (E, N, L) -> (E, D_batch, L) via batched matmul
-                numerator_per_sample = torch.bmm(ratio, exp_F.permute(0, 2, 1))  # (E, D_batch, L)
+                for e in range(E_samples):
+                    exp_F_e = exp_F[e]                             # (L, N)
+                    rate_e = torch.matmul(W, exp_F_e)              # (D_batch, N)
+                    ratio_e = X / (rate_e + eps)                   # (D_batch, N)
+                    numerator += torch.matmul(ratio_e, exp_F_e.T)  # (D_batch, L)
+                    if denominator_acc is not None:
+                        denominator_acc += exp_F_e.sum(dim=1)      # (L,)
 
                 if self.elbo_mode == 'expanded':
-                    numerator = numerator_per_sample.mean(dim=0)  # (D_batch, L)
-                    denominator = exp_mu_sigma.sum(dim=1)  # (L,) - analytic
+                    numerator = numerator / E_samples              # (D_batch, L)
+                    denominator = terms['exp_mu_sigma'].sum(dim=1)  # (L,) — analytic
                 else:  # simple
-                    numerator = numerator_per_sample.sum(dim=0)  # (D_batch, L)
-                    denominator = exp_F.sum(dim=(0, 2))  # (L,) - MC estimate
+                    denominator = denominator_acc                    # (L,) — MC
 
             # Apply multiplicative update: W <- W * num / denom
-            # denominator is (L,), broadcast to (D_batch, L)
             updated_W = W * numerator / (denominator + eps)
             updated_W.clamp_(min=eps)
 
-            # Update the appropriate rows of W
             if idy is not None:
                 self._raw.data[idy] = updated_W
             else:
