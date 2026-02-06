@@ -88,7 +88,8 @@ class PoissonFactorization(nn.Module):
         Z = torch.matmul(W, F)  # shape (E, D, N)
         return Z
 
-    def forward(self, idx=None, idy=None, E=10, X=None):
+    def forward(self, idx=None, idy=None, E=10, X=None,
+                coordinates=None, groups=None, spatial=False):
         """
         Forward pass: compute variational distributions and log-likelihood terms.
 
@@ -103,17 +104,35 @@ class PoissonFactorization(nn.Module):
             X: Input data (D, N) or (D_batch, N_batch). Required for
                memory-efficient MC accumulation. If None and MC is needed,
                falls back to full-tensor mode.
+            coordinates: Spatial coordinates (N_batch, 2) for GP prior. Required
+                when spatial=True.
+            groups: Group assignments (N_batch,) for MGGP prior. Required when
+                spatial=True and using multi-group GP.
+            spatial: Whether to use spatial GP forward pass.
 
         Returns:
-            terms: dict from compute_log_likelihood_terms()
-            qF: Variational posterior distribution (batched if idx provided)
-            pF: Prior distribution (batched if idx provided)
+            For non-spatial:
+                terms: dict from compute_log_likelihood_terms()
+                qF: Variational posterior distribution
+                pF: Prior distribution
+            For spatial:
+                terms: dict from compute_log_likelihood_terms()
+                qF: Variational posterior distribution from GP predictive
+                qU: Inducing point variational distribution
+                pU: Inducing point prior distribution (None for whitened)
         """
-        # Get variational distributions (batched on samples if idx provided)
-        if idx is not None:
-            qF, pF = self.prior.forward_batched(idx)
+        if spatial:
+            # Spatial GP forward pass
+            if groups is not None:
+                qF, qU, pU = self.prior(X=coordinates, groupsX=groups)
+            else:
+                qF, qU, pU = self.prior(X=coordinates)
         else:
-            qF, pF = self.prior()
+            # Standard GaussianPrior forward pass
+            if idx is not None:
+                qF, pF = self.prior.forward_batched(idx)
+            else:
+                qF, pF = self.prior()
 
         # Get W (optionally batched on features)
         W = self.W.data
@@ -127,6 +146,8 @@ class PoissonFactorization(nn.Module):
             return_samples=(self.loadings_mode == 'multiplicative'),
         )
 
+        if spatial:
+            return terms, qF, qU, pU
         return terms, qF, pF
 
     def project_parameters(self):
@@ -269,7 +290,21 @@ class PNMF:
         init: Optional[str] = 'random',
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
-        shuffle: bool = True
+        shuffle: bool = True,
+        # Spatial GP parameters
+        spatial: bool = False,
+        prior: str = 'GaussianPrior',
+        kernel: str = 'Matern32',
+        multigroup: bool = True,
+        num_inducing: int = 3000,
+        lengthscale: float = 1.0,
+        sigma: float = 1.0,
+        group_diff_param: float = 10.0,
+        jitter: float = 1e-5,
+        train_lengthscale: bool = False,
+        cholesky_mode: str = 'exp',
+        diagonal_only: bool = False,
+        inducing_allocation: str = 'proportional',
     ):
         self.n_components = n_components
         self.loadings_mode = loadings_mode
@@ -290,6 +325,25 @@ class PNMF:
         self.y_batch_size = y_batch_size
         self.shuffle = shuffle
 
+        # Spatial GP parameters
+        self.spatial = spatial
+        self.prior_type = prior
+        self.kernel = kernel
+        self.multigroup = multigroup
+        self.num_inducing = num_inducing
+        self.lengthscale = lengthscale
+        self.sigma = sigma
+        self.group_diff_param = group_diff_param
+        self.jitter = jitter
+        self.train_lengthscale = train_lengthscale
+        self.cholesky_mode = cholesky_mode
+        self.diagonal_only = diagonal_only
+        self.inducing_allocation = inducing_allocation
+
+        # Auto-set prior type when spatial=True
+        if self.spatial and prior == 'GaussianPrior':
+            self.prior_type = 'SVGP'
+
         # Attributes set during fit
         self.components_ = None
         self.n_components_ = n_components
@@ -300,6 +354,8 @@ class PNMF:
         self._prior = None
         self._optimizer = None
         self._w_optimizer = None
+        self._coordinates = None
+        self._groups = None
 
     def _validate_params(self):
         """Validate input parameters."""
@@ -341,6 +397,19 @@ class PNMF:
 
         if self.y_batch_size is not None and self.y_batch_size < 1:
             raise ValueError("y_batch_size must be >= 1 or None")
+
+        # Spatial parameter validation
+        if self.spatial:
+            if self.prior_type not in ['SVGP']:
+                raise ValueError("When spatial=True, prior must be 'SVGP'")
+            if self.kernel not in ['Matern32']:
+                raise ValueError("kernel must be 'Matern32'")
+            if self.training_mode == 'natural':
+                raise ValueError("Natural gradient training not supported with spatial priors")
+            if self.inducing_allocation not in ['proportional', 'equal']:
+                raise ValueError("inducing_allocation must be 'proportional' or 'equal'")
+            if self.num_inducing < 1:
+                raise ValueError("num_inducing must be >= 1")
 
     def _get_device(self):
         """Determine the device to use."""
@@ -391,6 +460,112 @@ class PNMF:
             idy = None
 
         return idx, idy
+
+    def _create_optimizer(self, params):
+        """Create optimizer based on self.optimizer setting."""
+        if self.optimizer == 'Adam':
+            return torch.optim.Adam(params, lr=self.learning_rate)
+        elif self.optimizer == 'AdamW':
+            return torch.optim.AdamW(params, lr=self.learning_rate)
+        elif self.optimizer == 'NAdam':
+            return torch.optim.NAdam(params, lr=self.learning_rate)
+        elif self.optimizer == 'SGD':
+            return torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9)
+        elif self.optimizer == 'RMSprop':
+            return torch.optim.RMSprop(params, lr=self.learning_rate)
+
+    def _create_spatial_prior(self, Y, coordinates, groups):
+        """
+        Create MGGP_SVGP or SVGP prior for spatial mode.
+
+        Args:
+            Y: Data tensor of shape (D, N)
+            coordinates: Spatial coordinates tensor of shape (N, 2)
+            groups: Group assignments tensor of shape (N,), or None
+
+        Returns:
+            gp: GP model (MGGP_SVGP or SVGP) ready for use as prior
+        """
+        try:
+            from gpzoo.kernels import batched_MGGP_Matern32, batched_Matern32
+            from gpzoo.gp import MGGP_SVGP, SVGP
+            from gpzoo.modules import CholeskyParameter
+            from gpzoo.model_utilities import mggp_kmeans_inducing_points
+        except ImportError:
+            raise ImportError(
+                "GPzoo is required for spatial mode. "
+                "Install with: pip install -e path/to/GPzoo"
+            )
+
+        D, N = Y.shape
+        L = self.n_components
+        n_groups = int(groups.max().item() + 1) if groups is not None else 1
+
+        # 1. Create kernel
+        if self.multigroup and groups is not None:
+            kernel = batched_MGGP_Matern32(
+                sigma=self.sigma,
+                lengthscale=self.lengthscale,
+                group_diff_param=self.group_diff_param,
+                n_groups=n_groups,
+            )
+        else:
+            kernel = batched_Matern32(
+                sigma=self.sigma,
+                lengthscale=self.lengthscale,
+            )
+
+        # 2. Select inducing points
+        M = min(self.num_inducing, N)
+        if self.multigroup and groups is not None:
+            Z, groupsZ = mggp_kmeans_inducing_points(
+                coordinates, groups, M,
+                seed=self.random_state or 123,
+                allocation=self.inducing_allocation,
+            )
+        else:
+            # Random subset selection for non-multigroup
+            perm = torch.randperm(N)[:M]
+            Z = coordinates[perm].clone()
+            groupsZ = None
+
+        # 3. Create GP
+        if self.multigroup and groups is not None:
+            gp = MGGP_SVGP(
+                kernel, dim=coordinates.shape[1], M=M, n_groups=n_groups,
+                jitter=self.jitter, cholesky_mode=self.cholesky_mode,
+                diagonal_only=self.diagonal_only,
+            )
+            gp.Z = nn.Parameter(Z, requires_grad=False)
+            gp.groupsZ = nn.Parameter(groupsZ, requires_grad=False)
+        else:
+            gp = SVGP(
+                kernel, dim=coordinates.shape[1], M=M,
+                jitter=self.jitter, cholesky_mode=self.cholesky_mode,
+                diagonal_only=self.diagonal_only,
+            )
+            gp.Z = nn.Parameter(Z, requires_grad=False)
+
+        # 4. Batch mu and Lu for L latent factors
+        #    SVGP creates mu (M,) and Lu (M, M) for a single output.
+        #    We need (L, M) and (L, M, M) for L latent factors.
+        from gpzoo.modules import CholeskyParameter
+        del gp.Lu
+        gp.Lu = CholeskyParameter(
+            (L, M), mode=self.cholesky_mode, diagonal_only=self.diagonal_only
+        )
+        gp.mu = nn.Parameter(torch.randn(L, M) * 0.01)
+
+        # 5. Freeze kernel hyperparameters
+        #    By default we freeze all kernel params (lengthscale, sigma, group_diff_param).
+        #    Only lengthscale can be optionally unfrozen via train_lengthscale=True.
+        if not self.train_lengthscale:
+            kernel.lengthscale.requires_grad = False
+        kernel.sigma.requires_grad = False
+        if hasattr(kernel, 'group_diff_param'):
+            kernel.group_diff_param.requires_grad = False
+
+        return gp
 
     def _initialize_parameters(self, X_torch: torch.Tensor):
         """
@@ -453,6 +628,8 @@ class PNMF:
         self,
         X: Union[np.ndarray, torch.Tensor],
         y: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        coordinates: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        groups: Optional[Union[np.ndarray, torch.Tensor]] = None,
         return_history: bool = False
     ) -> Union['PNMF', tuple[list[float], 'PNMF']]:
         """
@@ -466,6 +643,13 @@ class PNMF:
         y : Ignored
             Not used, present for scikit-learn compatibility.
 
+        coordinates : array-like of shape (n_samples, 2), optional
+            Spatial coordinates for each sample. Required when spatial=True.
+
+        groups : array-like of shape (n_samples,), optional
+            Integer group assignments for each sample. Required when
+            spatial=True and multigroup=True.
+
         return_history : bool, default=False
             If True, returns a tuple (history, self) where history is a list
             of ELBO values during training.
@@ -476,6 +660,19 @@ class PNMF:
             Returns the instance itself (or (history, self) if return_history=True).
         """
         self._validate_params()
+
+        # Validate spatial inputs
+        if self.spatial:
+            if coordinates is None:
+                raise ValueError(
+                    "coordinates is required when spatial=True. "
+                    "Pass coordinates of shape (n_samples, 2) to fit()."
+                )
+            if self.multigroup and groups is None:
+                raise ValueError(
+                    "groups is required when spatial=True and multigroup=True. "
+                    "Pass groups of shape (n_samples,) to fit()."
+                )
 
         # Set random seed
         if self.random_state is not None:
@@ -492,16 +689,42 @@ class PNMF:
         self.n_features_in_ = n_features
         self.n_components_ = self.n_components
 
-        # Convert to torch tensor and transpose for model (D, N)
-        X_torch = torch.from_numpy(X_np.T.astype(np.float32)).to(self._get_device())
+        device = self._get_device()
 
-        # Initialize prior with natural gradient mode if specified
-        use_natural_gradients = (self.training_mode == 'natural')
-        self._prior = GaussianPrior(
-            y=X_torch,
-            L=self.n_components,
-            use_natural_gradients=use_natural_gradients
-        ).to(self._get_device())
+        # Convert to torch tensor and transpose for model (D, N)
+        X_torch = torch.from_numpy(X_np.T.astype(np.float32)).to(device)
+
+        # Convert spatial inputs to tensors
+        if coordinates is not None:
+            if isinstance(coordinates, np.ndarray):
+                coords_torch = torch.from_numpy(coordinates.astype(np.float32)).to(device)
+            else:
+                coords_torch = coordinates.to(device).float()
+            self._coordinates = coords_torch
+        else:
+            coords_torch = None
+
+        if groups is not None:
+            if isinstance(groups, np.ndarray):
+                groups_torch = torch.from_numpy(groups.astype(np.int64)).to(device)
+            else:
+                groups_torch = groups.to(device).long()
+            self._groups = groups_torch
+        else:
+            groups_torch = None
+
+        # Initialize prior
+        if self.spatial:
+            self._prior = self._create_spatial_prior(
+                X_torch, coords_torch, groups_torch
+            ).to(device)
+        else:
+            use_natural_gradients = (self.training_mode == 'natural')
+            self._prior = GaussianPrior(
+                y=X_torch,
+                L=self.n_components,
+                use_natural_gradients=use_natural_gradients
+            ).to(device)
 
         # Initialize model
         self._model = PoissonFactorization(
@@ -510,59 +733,46 @@ class PNMF:
             L=self.n_components,
             loadings_mode=self.loadings_mode,
             mode=self.mode
-        ).to(self._get_device())
+        ).to(device)
 
-        # Apply custom initialization
-        self._initialize_parameters(X_torch)
+        # Apply custom initialization (only for non-spatial; spatial uses GP defaults)
+        if not self.spatial:
+            self._initialize_parameters(X_torch)
 
         # Setup optimizers based on training mode
         # For multiplicative mode, W is updated via multiplicative updates, not gradients
         use_multiplicative_w = (self.loadings_mode == 'multiplicative')
 
-        if self.training_mode == 'natural':
+        if self.spatial:
+            # Spatial mode: optimize GP parameters + W parameters together
+            gp_params = list(self._prior.parameters())
+            if use_multiplicative_w:
+                params = gp_params
+            else:
+                params = list(self._model.W.parameters()) + gp_params
+
+            self._optimizer = self._create_optimizer(params)
+            self._w_optimizer = None
+        elif self.training_mode == 'natural':
             # Natural gradient mode: dual optimizers
-            # NGD for variational parameters (natural params)
-            # Use smaller learning rate for NGD (0.1x) for stability
             nat_params = self._prior.natural_parameters()
             self._optimizer = NaturalGradientDescent(
                 nat_params, num_data=n_samples, lr=self.learning_rate * 0.1
             )
 
             if use_multiplicative_w:
-                # W uses multiplicative updates, no optimizer needed
                 self._w_optimizer = None
             else:
-                # Regular optimizer for W parameters
                 W_params = list(self._model.W.parameters())
-                if self.optimizer == 'Adam':
-                    self._w_optimizer = torch.optim.Adam(W_params, lr=self.learning_rate)
-                elif self.optimizer == 'AdamW':
-                    self._w_optimizer = torch.optim.AdamW(W_params, lr=self.learning_rate)
-                elif self.optimizer == 'NAdam':
-                    self._w_optimizer = torch.optim.NAdam(W_params, lr=self.learning_rate)
-                elif self.optimizer == 'SGD':
-                    self._w_optimizer = torch.optim.SGD(W_params, lr=self.learning_rate, momentum=0.9)
-                elif self.optimizer == 'RMSprop':
-                    self._w_optimizer = torch.optim.RMSprop(W_params, lr=self.learning_rate)
+                self._w_optimizer = self._create_optimizer(W_params)
         else:
             # Standard mode
             if use_multiplicative_w:
-                # Only optimize variational parameters, W uses multiplicative updates
                 params = list(self._prior.parameters())
             else:
-                # Optimize all parameters
                 params = list(self._model.W.parameters()) + list(self._prior.parameters())
 
-            if self.optimizer == 'Adam':
-                self._optimizer = torch.optim.Adam(params, lr=self.learning_rate)
-            elif self.optimizer == 'AdamW':
-                self._optimizer = torch.optim.AdamW(params, lr=self.learning_rate)
-            elif self.optimizer == 'NAdam':
-                self._optimizer = torch.optim.NAdam(params, lr=self.learning_rate)
-            elif self.optimizer == 'SGD':
-                self._optimizer = torch.optim.SGD(params, lr=self.learning_rate, momentum=0.9)
-            elif self.optimizer == 'RMSprop':
-                self._optimizer = torch.optim.RMSprop(params, lr=self.learning_rate)
+            self._optimizer = self._create_optimizer(params)
             self._w_optimizer = None
 
         # Training loop
@@ -578,7 +788,11 @@ class PNMF:
         y_batch_size = self.y_batch_size if self.y_batch_size is not None else D
 
         # Update progress bar description based on training mode
-        mode_desc = f"{self.mode} mode, {self.training_mode} training"
+        mode_desc = f"{self.mode} mode"
+        if self.spatial:
+            mode_desc += ", spatial"
+        else:
+            mode_desc += f", {self.training_mode} training"
         if use_batching:
             mode_desc += f", batch={x_batch_size}"
             if self.y_batch_size is not None:
@@ -592,7 +806,7 @@ class PNMF:
                 self._w_optimizer.zero_grad()
 
             # Get batch indices (None for full-batch mode)
-            idx, idy = self._get_batch_indices(N, D, self._get_device()) if use_batching else (None, None)
+            idx, idy = self._get_batch_indices(N, D, device) if use_batching else (None, None)
 
             # Get data batch
             if idx is not None and idy is not None:
@@ -604,24 +818,52 @@ class PNMF:
             else:
                 X_batch = X_torch
 
-            # Forward pass — terms contains all precomputed log-likelihood intermediates
-            terms, qF, pF = self._model.forward(idx, idy, E=self.E, X=X_batch)
+            if self.spatial:
+                # Spatial forward pass
+                coords_batch = coords_torch[idx] if idx is not None else coords_torch
+                groups_batch = groups_torch[idx] if (idx is not None and groups_torch is not None) else groups_torch
 
-            # Compute expected log-likelihood and KL separately
-            exp_ll, kl = compute_elbo(self.mode, terms, qF, pF, X_batch)
+                terms, qF, qU, pU = self._model.forward(
+                    idx=None, idy=idy, E=self.E, X=X_batch,
+                    coordinates=coords_batch, groups=groups_batch, spatial=True
+                )
 
-            # Scale expected log-likelihood for feature mini-batch
-            if self.y_batch_size is not None:
-                exp_ll = exp_ll * (D / min(self.y_batch_size, D))
+                # Compute expected log-likelihood
+                from .elbo import expected_log_likelihood as exp_ll_fn
+                exp_ll = exp_ll_fn(self.mode, terms, X_batch)
 
-            # Scale expected log-likelihood for sample mini-batch
-            if self.batch_size is not None:
-                exp_ll = exp_ll * (N / min(self.batch_size, N))
+                # Compute KL divergence via GP's method (whitened KL on inducing points)
+                # GP returns per-factor KL (shape (L,)), sum over factors
+                kl = self._prior.kl_divergence(qU, pU).sum()
 
-            # Scale KL for sample mini-batch
-            # (KL is over batched q(F) so it needs N-scaling)
-            if self.batch_size is not None:
-                kl = kl * (N / min(self.batch_size, N))
+                # Scale expected log-likelihood for feature mini-batch
+                if self.y_batch_size is not None:
+                    exp_ll = exp_ll * (D / min(self.y_batch_size, D))
+
+                # Scale expected log-likelihood for sample mini-batch
+                if self.batch_size is not None:
+                    exp_ll = exp_ll * (N / min(self.batch_size, N))
+
+                # KL is over inducing points (global), NOT data - no N-scaling needed
+            else:
+                # Standard (non-spatial) forward pass
+                terms, qF, pF = self._model.forward(idx, idy, E=self.E, X=X_batch)
+
+                # Compute expected log-likelihood and KL separately
+                exp_ll, kl = compute_elbo(self.mode, terms, qF, pF, X_batch)
+
+                # Scale expected log-likelihood for feature mini-batch
+                if self.y_batch_size is not None:
+                    exp_ll = exp_ll * (D / min(self.y_batch_size, D))
+
+                # Scale expected log-likelihood for sample mini-batch
+                if self.batch_size is not None:
+                    exp_ll = exp_ll * (N / min(self.batch_size, N))
+
+                # Scale KL for sample mini-batch
+                # (KL is over batched q(F) so it needs N-scaling)
+                if self.batch_size is not None:
+                    kl = kl * (N / min(self.batch_size, N))
 
             # Loss = -ELBO = KL - E[log p(X|F)]
             loss = kl - exp_ll
@@ -630,13 +872,13 @@ class PNMF:
             loss.backward()
 
             # Step optimizers for variational parameters
-            if self.training_mode == 'natural':
+            if self.training_mode == 'natural' and not self.spatial:
                 # Natural gradient mode: step NGD for variational parameters
                 self._optimizer.step()
                 if self._w_optimizer is not None:
-                    self._w_optimizer.step()  # Adam for W parameters (if not multiplicative)
+                    self._w_optimizer.step()
             else:
-                # Standard mode: single optimizer
+                # Standard mode or spatial mode: single optimizer
                 self._optimizer.step()
 
             # Handle W updates based on loadings_mode
@@ -681,30 +923,69 @@ class PNMF:
             return elbo_history, self
         return self
 
-    def transform(self, X: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    def transform(
+        self,
+        X: Union[np.ndarray, torch.Tensor],
+        coordinates: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        groups: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    ) -> np.ndarray:
         """
         Transform X using the fitted model.
 
-        Given fixed W (stored in components\\_), find the optimal exp(F) for new X.
-
-        Note: This uses a simple NNLS (non-negative least squares) approach.
-        For sklearn NMF compatibility, the returned value represents exp(F) in
-        our model notation (called W in sklearn NMF's X ≈ W @ H.T notation).
+        For non-spatial models, uses NNLS multiplicative updates to find exp(F).
+        For spatial models, uses GP predictive equations at new coordinates.
 
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
             Input data matrix.
 
+        coordinates : array-like of shape (n_samples, 2), optional
+            Spatial coordinates for new samples. Required when spatial=True.
+
+        groups : array-like of shape (n_samples,), optional
+            Group assignments for new samples. Required when spatial=True
+            and multigroup=True.
+
         Returns
         -------
         transformed : ndarray of shape (n_samples, n_components)
-            Transformed data (exp(F) in our model notation, corresponding to
-            sklearn NMF's W coefficient matrix).
+            Transformed data (exp(F) in our model notation).
         """
         if self.components_ is None:
             raise ValueError("Model has not been fitted yet.")
 
+        if self.spatial:
+            if coordinates is None:
+                raise ValueError("coordinates is required for transform() when spatial=True")
+            if self.multigroup and groups is None:
+                raise ValueError("groups is required for transform() when spatial=True and multigroup=True")
+
+            device = self._get_device()
+
+            # Convert to tensors
+            if isinstance(coordinates, np.ndarray):
+                coords_t = torch.from_numpy(coordinates.astype(np.float32)).to(device)
+            else:
+                coords_t = coordinates.to(device).float()
+
+            if groups is not None:
+                if isinstance(groups, np.ndarray):
+                    groups_t = torch.from_numpy(groups.astype(np.int64)).to(device)
+                else:
+                    groups_t = groups.to(device).long()
+            else:
+                groups_t = None
+
+            with torch.no_grad():
+                if groups_t is not None:
+                    qF, _, _ = self._prior(X=coords_t, groupsX=groups_t)
+                else:
+                    qF, _, _ = self._prior(X=coords_t)
+                # Return exp(mean) as the point estimate
+                return torch.exp(qF.mean).T.cpu().numpy()  # (N_new, L)
+
+        # Non-spatial: NNLS multiplicative updates
         if isinstance(X, torch.Tensor):
             X = X.detach().cpu().numpy()
 
@@ -723,7 +1004,13 @@ class PNMF:
 
         return H
 
-    def fit_transform(self, X: Union[np.ndarray, torch.Tensor], **kwargs) -> np.ndarray:
+    def fit_transform(
+        self,
+        X: Union[np.ndarray, torch.Tensor],
+        coordinates: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        groups: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        **kwargs
+    ) -> np.ndarray:
         """
         Fit the model and transform X.
 
@@ -732,6 +1019,12 @@ class PNMF:
         X : array-like of shape (n_samples, n_features)
             Input data matrix.
 
+        coordinates : array-like of shape (n_samples, 2), optional
+            Spatial coordinates. Required when spatial=True.
+
+        groups : array-like of shape (n_samples,), optional
+            Group assignments. Required when spatial=True and multigroup=True.
+
         **kwargs : Additional arguments to pass to fit()
 
         Returns
@@ -739,8 +1032,8 @@ class PNMF:
         transformed : ndarray of shape (n_samples, n_components)
             Transformed data (exp(F) in our model notation).
         """
-        self.fit(X, **kwargs)
-        return self.transform(X)
+        self.fit(X, coordinates=coordinates, groups=groups, **kwargs)
+        return self.transform(X, coordinates=coordinates, groups=groups)
 
     def inverse_transform(self, transformed: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
         """

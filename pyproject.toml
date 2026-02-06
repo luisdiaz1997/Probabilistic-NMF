@@ -32,6 +32,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+spatial = [
+    "gpzoo @ git+https://github.com/luisdiaz1997/GPzoo.git",
+    "faiss-cpu>=1.7.0",
+]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
