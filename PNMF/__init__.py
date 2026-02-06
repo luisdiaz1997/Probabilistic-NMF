@@ -31,6 +31,7 @@ from .models import PNMF, PoissonFactorization
 from .priors import GaussianPrior
 from .elbo import (
     compute_elbo,
+    compute_log_likelihood_terms,
     expected_log_likelihood,
     kl_divergence,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "GaussianPrior",
     # ELBO functions
     "compute_elbo",
+    "compute_log_likelihood_terms",
     "expected_log_likelihood",
     "kl_divergence",
     # Initialization

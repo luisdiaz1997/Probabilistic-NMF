@@ -13,7 +13,7 @@ import numpy as np
 from typing import Union, Optional
 from tqdm.auto import tqdm
 
-from .elbo import compute_elbo
+from .elbo import compute_elbo, compute_log_likelihood_terms
 from .priors import GaussianPrior
 
 
@@ -449,15 +449,14 @@ def transform_F(
         # Get variational distribution
         qF, pF = prior()
 
-        # Sample F
-        F_samples = qF.rsample((E,))  # (E, L, N)
-
-        # Compute rate: W @ exp(F) -> (E, D, N)
-        F_exp = torch.exp(F_samples)  # (E, L, N)
-        rate = torch.matmul(W_torch, F_exp)  # (E, D, N)
+        # Compute log-likelihood terms
+        terms = compute_log_likelihood_terms(
+            W=W_torch, qF=qF, X=X_torch, E=E, mode=mode,
+        )
 
         # Compute ELBO loss
-        loss = compute_elbo(mode, rate, qF, pF, X_torch, W_torch)
+        exp_ll, kl = compute_elbo(mode, terms, qF, pF, X_torch)
+        loss = kl - exp_ll
 
         # Backward and step
         loss.backward()

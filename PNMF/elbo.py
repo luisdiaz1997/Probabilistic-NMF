@@ -5,7 +5,7 @@ This module provides different strategies for computing the expected log-likelih
 E[log p(Y|F)] and the full Evidence Lower Bound (ELBO).
 
 Expected log-likelihood modes:
-- simple: Full Monte Carlo estimation using torch.distributions.Poisson
+- simple: Full Monte Carlo estimation (X * log(rate) - rate - log(X!))
 - expanded: Hybrid Monte Carlo + analytic expectation (default, lower variance)
 - lower-bound: Jensen's lower bound (fully analytic, no MC sampling)
 
@@ -40,170 +40,193 @@ def poisson_log_likelihood(X: torch.Tensor, rate: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
+# Precompute log-likelihood terms
+# =============================================================================
+
+
+def compute_log_likelihood_terms(W, qF, X, E, mode, return_samples=False):
+    """
+    Precompute all intermediate tensors needed for expected log-likelihood.
+
+    This function centralizes the computation of:
+    - exp(μ) and exp(μ + σ²/2) — computed once, reused across modes
+    - W @ exp(μ) and W @ exp(μ + σ²/2) — computed once via 2D matmul
+    - MC scalar accumulations for the ELBO (term1_mc, term2_mc)
+    - Optionally, full sample tensors for downstream consumers that need the
+      same MC samples (e.g. multiplicative W updates)
+
+    Args:
+        W: Loadings matrix, shape (D, L)
+        qF: Variational posterior (torch.distributions.Normal) with .mean and .scale
+        X: Input data, shape (D, N). Required for MC modes.
+        E: Number of Monte Carlo samples. Ignored for lower-bound mode.
+        mode: 'simple', 'expanded', or 'lower-bound'
+        return_samples: If True, also store 'exp_F_samples' (E, L, N) in the
+                        returned dict so that downstream code (e.g. multiplicative
+                        W update) can reuse the same MC samples. Default False.
+                        Note: rate_mc (E, D, N) is NOT stored — downstream code
+                        should compute W @ exp_F_samples itself if needed.
+
+    Returns:
+        dict with keys (only those needed by the given mode):
+            Always present:
+                'exp_mu':        exp(μ),              shape (L, N)
+
+            When mode in ['expanded', 'lower-bound']:
+                'exp_mu_sigma':  exp(μ + σ²/2),       shape (L, N)
+                'rate_mgf':      W @ exp(μ + σ²/2),   shape (D, N)
+
+            When mode == 'lower-bound':
+                'rate_mean':     W @ exp(μ),           shape (D, N)
+
+            When mode in ['simple', 'expanded']:
+                'term1_mc':    (1/E) * Σ_e (X * log(rate_e)).sum(),  scalar
+                'term2_mc':    (1/E) * Σ_e rate_e.sum(),             scalar  [simple only]
+
+            When mode in ['simple', 'expanded'] and return_samples=True:
+                'exp_F_samples':  exp(F_samples),       shape (E, L, N)
+    """
+    mu = qF.mean       # (L, N)
+    sigma = qF.scale    # (L, N)
+
+    # exp(μ) — always needed (MC loop uses it, lower-bound uses it)
+    exp_mu = torch.exp(mu)                          # (L, N)
+    terms = {'exp_mu': exp_mu}
+
+    # exp(μ + σ²/2) and W @ exp(μ + σ²/2) — needed by expanded and lower-bound
+    if mode in ('expanded', 'lower-bound'):
+        exp_mu_sigma = torch.exp(mu + 0.5 * sigma ** 2)  # (L, N)
+        terms['exp_mu_sigma'] = exp_mu_sigma
+        terms['rate_mgf'] = torch.matmul(W, exp_mu_sigma) # (D, N)
+
+    # W @ exp(μ) — only needed by lower-bound
+    if mode == 'lower-bound':
+        terms['rate_mean'] = torch.matmul(W, exp_mu)       # (D, N)
+
+    # For lower-bound mode, no MC computation needed
+    if mode == 'lower-bound':
+        return terms
+
+    # MC modes: simple or expanded
+    # Memory-efficient loop — accumulate (D, N) buffers, never materialize (E, D, N)
+    # When return_samples=True, also collect exp_F_samples (E, L, N) for downstream reuse
+    D, N = X.shape
+    log_acc = torch.zeros(D, N, dtype=X.dtype, device=X.device)
+    linear_acc = torch.zeros(D, N, dtype=X.dtype, device=X.device) if mode == 'simple' else None
+    exp_F_list = [] if return_samples else None
+
+    for e in range(E):
+        eps_e = torch.randn_like(mu)                          # (L, N)
+        perturbation = torch.exp(eps_e * sigma)                # (L, N)
+        exp_F_e = exp_mu * perturbation                        # (L, N)
+        rate_e = torch.matmul(W, exp_F_e)                      # (D, N)
+        log_acc += X * torch.log(rate_e.clamp(min=1e-8))       # (D, N)
+        if linear_acc is not None:
+            linear_acc += rate_e                                # (D, N)
+        if exp_F_list is not None:
+            exp_F_list.append(exp_F_e)                         # (L, N)
+
+    terms['term1_mc'] = log_acc.sum() / E    # scalar
+    if mode == 'simple':
+        terms['term2_mc'] = linear_acc.sum() / E  # scalar
+
+    if return_samples:
+        terms['exp_F_samples'] = torch.stack(exp_F_list)   # (E, L, N)
+
+    return terms
+
+
+# =============================================================================
 # Expected log-likelihood functions (modes)
 # =============================================================================
 
 
-def expected_log_likelihood_simple(rate, X):
+def expected_log_likelihood_simple(terms, X):
     """
     Compute expected log-likelihood using full Monte Carlo estimation.
 
-    Uses torch.distributions.Poisson.log_prob() for computing the
-    log-likelihood, providing a clean and numerically stable implementation.
+    E[log p(X|rate)] = (1/E) Σ_e Σ_ij [X_ij * log(rate_e_ij) - rate_e_ij] - Σ_ij log(X_ij!)
 
-    The Poisson log-likelihood is:
-        log p(X|rate) = X * log(rate) - rate - log(X!)
+    All three Poisson log-PMF terms are estimated via MC samples.
 
     Args:
-        rate: Poisson rate tensor of shape (E, D, N)
+        terms: dict from compute_log_likelihood_terms().
+               Required keys: 'term1_mc', 'term2_mc'.
         X: Input data tensor of shape (D, N)
 
     Returns:
         Expected log-likelihood E[log p(Y|F)] (scalar)
     """
-    E_samples = rate.shape[0]
-
-    # Expand X to match rate shape: (D, N) -> (E, D, N)
-    X_expanded = X.unsqueeze(0).expand(E_samples, -1, -1)
-
-    # Use torch.distributions.Poisson for clean, numerically stable computation
-    poisson_dist = torch.distributions.Poisson(rate=rate)
-    log_likelihood_mc = poisson_dist.log_prob(X_expanded)
-
-    # Expected log likelihood via Monte Carlo: (1/E) * sum_e log p(Y|F_e)
-    expected_log_likelihood = log_likelihood_mc.sum() / E_samples
-
-    return expected_log_likelihood
+    return terms['term1_mc'] - terms['term2_mc'] - torch.lgamma(X + 1).sum()
 
 
-def expected_log_likelihood_expanded(rate, qF, X, W):
+def expected_log_likelihood_expanded(terms, X):
     """
     Compute expected log-likelihood using the expanded expectation form.
 
-    The expected log-likelihood is computed as:
-        E[log p(Y|F)] = Y * E[log(sum(W * exp(F)))] - sum(W * E[exp(F)]) - sum(log(Y!))
-
-    where:
-    - The first term uses Monte Carlo estimation (requires log of sum)
-    - The second term is computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
-    - The third term is the Poisson normalization constant (log factorial)
+    Term 1 (MC):       (1/E) Σ_e Σ_ij X_ij * log(rate_e_ij)
+    Term 2 (analytic):  Σ_ij [W @ exp(μ + σ²/2)]_ij
+    Term 3 (constant):  -Σ_ij log(X_ij!)
 
     Args:
-        rate: Poisson rate tensor of shape (E, D, N)
-        qF: Variational posterior distribution with mean and scale
+        terms: dict from compute_log_likelihood_terms().
+               Required keys: 'term1_mc', 'rate_mgf'.
         X: Input data tensor of shape (D, N)
-        W: Loadings matrix tensor of shape (D, L)
 
     Returns:
         Expected log-likelihood E[log p(Y|F)] (scalar)
     """
-    E_samples = rate.shape[0]
-
-    # --- First term: Y_ij * E_q[log sum_l W_jl * exp(F_il)] ---
-    # This requires Monte Carlo estimation
-    eps = 1e-8
-    rate_clamped = rate.clamp(min=eps)
-    X_expanded = X.unsqueeze(0).expand(E_samples, -1, -1)  # (E, D, N)
-
-    # E[Y * log(rate)] = (1/E) * sum_e Y * log(rate_e)
-    term1_mc = (X_expanded * torch.log(rate_clamped)).sum() / E_samples
-
-    # --- Second term: sum_l W_jl * E_q[exp(F_il)] ---
-    # Computed analytically using E[exp(F)] = exp(mu + sigma^2/2)
-    # qF.mean has shape (L, N), qF.scale has shape (L, N)
-    mu = qF.mean  # (L, N)
-    sigma = qF.scale  # (L, N)
-
-    # E[exp(F_il)] = exp(mu_il + sigma_il^2 / 2)
-    exp_expectation = torch.exp(mu + 0.5 * sigma ** 2)  # (L, N)
-
-    # W has shape (D, L), need to compute: sum_j sum_l W_jl * exp_expectation[l, n]
-    term2_analytic = torch.matmul(W, exp_expectation).sum()  # scalar
-
-    # Expected log likelihood (including the Poisson normalization -log(Y!) term)
-    # Using lgamma(X+1) = log(X!) for the Poisson PMF normalization
-    expected_log_likelihood = term1_mc - term2_analytic - torch.lgamma(X + 1).sum()
-
-    return expected_log_likelihood
+    term1 = terms['term1_mc']               # MC scalar
+    term2 = terms['rate_mgf'].sum()          # analytic scalar
+    term3 = torch.lgamma(X + 1).sum()        # constant
+    return term1 - term2 - term3
 
 
-def expected_log_likelihood_lower_bound(qF, X, W):
+def expected_log_likelihood_lower_bound(terms, X):
     """
     Compute expected log-likelihood using Jensen's lower bound (fully analytic).
 
-    Uses Jensen's inequality for the log-sum-exp term:
-        E[log Σ W * exp(F)] ≥ log Σ W * exp(E[F])
-
-    For Gaussian variational distribution with mean μ and variance σ²:
-        E[F] = μ
-
-    This gives a true lower bound on E[log p(Y|F)] with NO Monte Carlo sampling.
-
-    The expected log-likelihood is computed as:
-        E[log p(Y|F)] ≈ Y * log(Σ W * exp(μ)) - Σ W * exp(μ + σ²/2) - log(Y!)
+    Term 1: Σ_ij X_ij * log([W @ exp(μ)]_ij)
+    Term 2: Σ_ij [W @ exp(μ + σ²/2)]_ij
+    Term 3: -Σ_ij log(X_ij!)
 
     Args:
-        qF: Variational posterior distribution with mean and scale
+        terms: dict from compute_log_likelihood_terms()
         X: Input data tensor of shape (D, N)
-        W: Loadings matrix tensor of shape (D, L)
 
     Returns:
         Lower bound on expected log-likelihood E[log p(Y|F)] (scalar)
     """
-    # Get variational parameters
-    mu = qF.mean  # (L, N)
-    sigma = qF.scale  # (L, N)
-
-    # --- First term (Jensen lower bound): Y_ij * log(Σ_l W_jl * exp(μ_il)) ---
-    # Lower bound: E[log Σ W * exp(F)] ≥ log Σ W * exp(E[F]) = log Σ W * exp(μ)
-    exp_mu = torch.exp(mu)  # (L, N)
-
-    # rate_lower_bound has shape (D, N): sum over L of W_jl * exp(μ_il)
-    rate_lower_bound = torch.matmul(W, exp_mu)  # (D, N)
-
-    eps = 1e-8
-    rate_clamped = rate_lower_bound.clamp(min=eps)
-
-    # Y * log(rate) using the lower bound
-    term1_lower = (X * torch.log(rate_clamped)).sum()
-
-    # --- Second term (analytic): Σ_l W_jl * E[exp(F_il)] ---
-    # E[exp(F)] = exp(μ + σ²/2)
-    exp_expectation = torch.exp(mu + 0.5 * sigma ** 2)  # (L, N)
-    term2_analytic = torch.matmul(W, exp_expectation).sum()  # scalar
-
-    # Expected log likelihood (including Poisson normalization)
-    # Note: Since we use a lower bound on the log term, this is a true lower bound
-    expected_log_likelihood = term1_lower - term2_analytic - torch.lgamma(X + 1).sum()
-
-    return expected_log_likelihood
+    rate_mean = terms['rate_mean'].clamp(min=1e-8)    # (D, N)
+    term1 = (X * torch.log(rate_mean)).sum()          # scalar
+    term2 = terms['rate_mgf'].sum()                   # scalar
+    term3 = torch.lgamma(X + 1).sum()                 # scalar
+    return term1 - term2 - term3
 
 
-def expected_log_likelihood(mode, rate, qF, X, W):
+def expected_log_likelihood(mode, terms, X):
     """
     Compute expected log-likelihood E[log p(Y|F)].
 
     This function dispatches to the appropriate computation based on mode:
-    - 'simple': Uses torch.distributions.Poisson.log_prob() directly
-    - 'expanded': Uses hybrid Monte Carlo + analytic expectation
-    - 'lower-bound': Uses Jensen's lower bound (fully analytic, no MC)
+    - 'simple': Full Monte Carlo (X * log(rate) - rate - log(X!))
+    - 'expanded': Hybrid Monte Carlo + analytic expectation
+    - 'lower-bound': Jensen's lower bound (fully analytic, no MC)
 
     Args:
         mode: Computation mode ('simple', 'expanded', or 'lower-bound')
-        rate: Poisson rate tensor of shape (E, D, N) [unused for lower-bound]
-        qF: Variational posterior distribution with mean and scale
+        terms: dict from compute_log_likelihood_terms()
         X: Input data tensor of shape (D, N)
-        W: Loadings matrix tensor of shape (D, L)
 
     Returns:
         Expected log-likelihood E[log p(Y|F)] (scalar)
     """
     if mode == 'simple':
-        return expected_log_likelihood_simple(rate, X)
+        return expected_log_likelihood_simple(terms, X)
     elif mode == 'lower-bound':
-        return expected_log_likelihood_lower_bound(qF, X, W)
+        return expected_log_likelihood_lower_bound(terms, X)
     else:  # 'expanded'
-        return expected_log_likelihood_expanded(rate, qF, X, W)
+        return expected_log_likelihood_expanded(terms, X)
 
 
 # =============================================================================
@@ -232,36 +255,37 @@ def kl_divergence(qF, pF):
 # =============================================================================
 
 
-def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None):
+def compute_elbo(mode, terms, qF, pF, X, kl_fn=None):
     """
-    Compute the Evidence Lower BOund (ELBO).
+    Compute expected log-likelihood and KL divergence separately.
 
-    ELBO = E[log p(Y|F)] - KL[q(F) || p(F)]
+    ELBO = E[log p(X|F)] - KL[q(F) || p(F)]
 
-    This function computes the expected log-likelihood using the specified mode
-    and subtracts the KL divergence. A custom KL function can be provided.
+    Returns the two terms as separate tensors so the caller can scale them
+    independently in the training loop. This is critical because:
+    - The log-likelihood term scales by D/y_batch_size and N/batch_size
+    - The KL term scales by N/batch_size only when KL is over batched q(F)
+    - For global KL sources (e.g., SVGP inducing points), KL should NOT be scaled
 
     Args:
         mode: Expected log-likelihood mode ('simple', 'expanded', or 'lower-bound')
-        rate: Poisson rate tensor of shape (E, D, N) [unused for lower-bound]
+        terms: dict from compute_log_likelihood_terms()
         qF: Variational posterior distribution with mean and scale
         pF: Prior distribution
         X: Input data tensor of shape (D, N)
-        W: Loadings matrix tensor of shape (D, L)
         kl_fn: Optional custom KL divergence function. If None, uses standard
                torch.distributions.kl_divergence. Should take (qF, pF) and return scalar.
 
     Returns:
-        Expected log-likelihood and KL divergence
+        (exp_ll, kl): tuple of two scalars
+            exp_ll: E_q[log p(X | F)]
+            kl:     KL[q(F) || p(F)]
     """
-    # Compute expected log-likelihood using the specified mode
-    exp_log_likelihood = expected_log_likelihood(mode, rate, qF, X, W)
+    exp_ll = expected_log_likelihood(mode, terms, X)
 
-    # Compute KL divergence (use custom function if provided)
     if kl_fn is not None:
         kl = kl_fn(qF, pF)
     else:
         kl = kl_divergence(qF, pF)
 
-    # return expected log-likelihood and KL divergence
-    return exp_log_likelihood, kl
+    return exp_ll, kl
