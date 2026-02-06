@@ -252,7 +252,7 @@ def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None):
                torch.distributions.kl_divergence. Should take (qF, pF) and return scalar.
 
     Returns:
-        Negative ELBO (to minimize)
+        Expected log-likelihood and KL divergence
     """
     # Compute expected log-likelihood using the specified mode
     exp_log_likelihood = expected_log_likelihood(mode, rate, qF, X, W)
@@ -263,5 +263,5 @@ def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None):
     else:
         kl = kl_divergence(qF, pF)
 
-    # Negative ELBO (for minimization)
-    return kl - exp_log_likelihood
+    # return expected log-likelihood and KL divergence
+    return exp_log_likelihood, kl

@@ -188,15 +188,15 @@ class PNMF:
         Device to use for computation. 'auto' will select mps (Apple Silicon),
         cuda (NVIDIA), or cpu in that order based on availability.
 
-    init : {None, 'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means'}, default=None
+    init : {'random', 'nndsvd', 'nndsvda', 'nndsvdar', 'k-means', None}, default='random'
         Initialization method for W and exp(F):
-        - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
-          otherwise 'random'.
-        - 'random': Non-negative random matrices, scaled with sqrt(X.mean() / n_components).
+        - 'random': Non-negative random matrices, scaled with sqrt(X.mean() / n_components) (default).
         - 'nndsvd': Nonnegative Double SVD (better for sparseness).
         - 'nndsvda': NNDSVD with zeros filled with average of X (better for dense data).
         - 'nndsvdar': NNDSVD with zeros filled with small random values (faster dense).
         - 'k-means': K-means clustering based initialization.
+        - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
+          otherwise 'random'.
 
     batch_size : int, default=None
         Size of mini-batches for samples (N dimension). If None, uses full batch.
@@ -257,7 +257,7 @@ class PNMF:
         random_state: Optional[int] = None,
         verbose: bool = False,
         device: str = 'auto',
-        init: Optional[str] = None,
+        init: Optional[str] = 'random',
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
         shuffle: bool = True
@@ -604,11 +604,13 @@ class PNMF:
                 W = W[idy]
 
             # Compute ELBO loss
-            loss = compute_elbo(self.mode, rate, qF, pF, X_batch, W)
+            exp_log_likelihood, kl = compute_elbo(self.mode, rate, qF, pF, X_batch, W)
 
             # Scale ELBO for mini-batch
             if self.y_batch_size is not None:
-                loss = loss * (D / min(self.y_batch_size, D))
+                exp_log_likelihood = exp_log_likelihood * (D / min(self.y_batch_size, D))
+
+            loss = kl - exp_log_likelihood
             if self.batch_size is not None:
                 loss = loss * (N / min(self.batch_size, N))
 
