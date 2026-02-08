@@ -554,7 +554,10 @@ class PNMF:
         gp.Lu = CholeskyParameter(
             (L, M), mode=self.cholesky_mode, diagonal_only=self.diagonal_only
         )
-        gp.mu = nn.Parameter(torch.randn(L, M) * 0.01)
+        Lu_init = torch.zeros(L, M, M)
+        Lu_init[:, range(M), range(M)] = torch.rand(L, M)
+        gp.Lu.data = Lu_init
+        gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
 
         # 5. Freeze kernel hyperparameters
         #    By default we freeze all kernel params (lengthscale, sigma, group_diff_param).
@@ -567,21 +570,21 @@ class PNMF:
 
         return gp
 
-    def _initialize_parameters(self, X_torch: torch.Tensor):
+    def _initialize_W(self, X_torch: torch.Tensor):
         """
-        Initialize W and variational parameters using specified init method.
+        Initialize W (loadings) using the same strategy for spatial and non-spatial.
 
         Parameters
         ----------
         X_torch : torch.Tensor of shape (D, N)
             Input data tensor (transposed: features x samples).
 
-        Notes
-        -----
-        This method initializes:
-        - W (loadings matrix) via PositiveParameter
-        - GaussianPrior mean (μ) based on log of initialized exp(F)
-        - GaussianPrior scale (σ) to a small default value
+        Returns
+        -------
+        W_init : ndarray of shape (D, L)
+            Initialized loadings matrix.
+        exp_F_init : ndarray of shape (N, L)
+            Initialized expected latent factors (exp-space).
         """
         # Convert back to numpy for initialization (transpose to sklearn format)
         X_np = X_torch.T.cpu().numpy()  # (N, D)
@@ -592,14 +595,23 @@ class PNMF:
         )
 
         # Initialize W (loadings) - shape (D, L)
-        # W_init is (D, L), which matches our internal W shape
-        self._model.W.data = torch.from_numpy(W_init.astype(np.float32)).to(self._get_device())
+        device = self._get_device()
+        self._model.W.data = torch.from_numpy(W_init.astype(np.float32)).to(device)
 
-        # Initialize variational mean (μ)
-        # F is in log-space, so μ = log(exp_F) = log(initial value)
-        # Need to handle zeros: log(exp_F + eps)
+        return W_init, exp_F_init
+
+    def _initialize_mu_nonspatial(self, exp_F_init: np.ndarray):
+        """
+        Initialize variational mean (μ) for non-spatial models.
+
+        Parameters
+        ----------
+        exp_F_init : ndarray of shape (N, L)
+            Initialized expected latent factors from _initialize_W().
+        """
+        device = self._get_device()
         eps = 1e-8
-        log_F_init = np.log(exp_F_init + eps)  # (N, L) -> need (L, N)
+        log_F_init = np.log(exp_F_init + eps)  # (N, L)
         mu_init = log_F_init.T  # (L, N)
 
         if self.training_mode == 'natural':
@@ -610,13 +622,13 @@ class PNMF:
             s2_init = 0.1
             self._prior.theta1.data = torch.from_numpy(
                 (mu_init / s2_init).astype(np.float32)
-            ).to(self._get_device())
+            ).to(device)
             self._prior.theta2.data.fill_(-1.0 / (2.0 * s2_init))
         else:
             # Standard parameterization
             self._prior.mean.data = torch.from_numpy(
                 mu_init.astype(np.float32)
-            ).to(self._get_device())
+            ).to(device)
 
             # Initialize scale to small value (we're fairly confident in initialization)
             # For softplus mode: raw parameter such that softplus(raw) ≈ 0.1
@@ -735,9 +747,12 @@ class PNMF:
             mode=self.mode
         ).to(device)
 
-        # Apply custom initialization (only for non-spatial; spatial uses GP defaults)
+        # Initialize W (data-aware, shared by both spatial and non-spatial)
+        W_init, exp_F_init = self._initialize_W(X_torch)
+
+        # Initialize variational parameters (different for spatial vs non-spatial)
         if not self.spatial:
-            self._initialize_parameters(X_torch)
+            self._initialize_mu_nonspatial(exp_F_init)
 
         # Setup optimizers based on training mode
         # For multiplicative mode, W is updated via multiplicative updates, not gradients

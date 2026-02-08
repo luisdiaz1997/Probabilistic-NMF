@@ -29,13 +29,11 @@ dependencies = [
     "torch>=1.9.0",
     "numpy>=1.19.0",
     "tqdm>=4.0.0",
+    "faiss-cpu>=1.7.0",
+    "gpzoo @ git+https://github.com/luisdiaz1997/GPzoo.git",
 ]
 
 [project.optional-dependencies]
-spatial = [
-    "gpzoo @ git+https://github.com/luisdiaz1997/GPzoo.git",
-    "faiss-cpu>=1.7.0",
-]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
