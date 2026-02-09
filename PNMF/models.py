@@ -897,7 +897,9 @@ class PNMF:
 
                 # Compute KL divergence via GP's method (whitened KL on inducing points)
                 # GP returns per-factor KL (shape (L,)), sum over factors
-                kl = self._prior.kl_divergence(qU, pU).sum()
+                # Scale by N/M to match non-spatial KL-to-likelihood ratio
+                M = self._prior.Z.shape[0]
+                kl = self._prior.kl_divergence(qU, pU).sum() * (N / M)
 
                 # Scale expected log-likelihood for feature mini-batch
                 if self.y_batch_size is not None:
