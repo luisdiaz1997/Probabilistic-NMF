@@ -239,6 +239,53 @@ class PNMF:
     shuffle : bool, default=True
         Whether to shuffle sample indices between iterations (for mini-batch mode).
 
+    Spatial GP Parameters
+    --------------------
+    spatial : bool, default=False
+        Enable spatial GP prior (SVGP) instead of independent Gaussian prior.
+        Requires coordinates and groups to be provided in fit().
+
+    prior : str, default='GaussianPrior'
+        Type of prior to use. Auto-set to 'SVGP' when spatial=True.
+
+    kernel : str, default='Matern32'
+        Kernel function for spatial GP. Currently only 'Matern32' is supported.
+
+    multigroup : bool, default=True
+        Use multi-group GP (MGGP) with group-aware spatial smoothing.
+
+    num_inducing : int, default=3000
+        Number of inducing points for SVGP approximation.
+
+    lengthscale : float, default=1.0
+        Kernel lengthscale for spatial correlation.
+
+    sigma : float, default=1.0
+        Kernel output scale (amplitude).
+
+    group_diff_param : float, default=10.0
+        Group difference parameter for MGGP. Higher values = stronger group separation.
+
+    jitter : float, default=1e-5
+        Jitter term for numerical stability in Cholesky decomposition.
+
+    train_lengthscale : bool, default=False
+        Whether to train the kernel lengthscale (currently not supported).
+
+    cholesky_mode : str, default='exp'
+        Cholesky diagonal constraint mode ('exp', 'softplus').
+
+    diagonal_only : bool, default=False
+        Use diagonal-only variational covariance for inducing points.
+
+    inducing_allocation : str, default='proportional'
+        How to distribute inducing points across groups:
+        - 'proportional': Allocate points proportionally to group sizes (default).
+        - 'equal': Allocate equal points to each group.
+        - 'derived': Run K-means on all data for optimal spatial coverage,
+          then use KNN (k=5, distance-weighted) to classify centroids to groups.
+          Falls back to proportional for groups with no assigned points.
+
     Attributes
     ----------
     components_ : ndarray of shape (n_components, n_features)
@@ -406,8 +453,8 @@ class PNMF:
                 raise ValueError("kernel must be 'Matern32'")
             if self.training_mode == 'natural':
                 raise ValueError("Natural gradient training not supported with spatial priors")
-            if self.inducing_allocation not in ['proportional', 'equal']:
-                raise ValueError("inducing_allocation must be 'proportional' or 'equal'")
+            if self.inducing_allocation not in ['proportional', 'equal', 'derived']:
+                raise ValueError("inducing_allocation must be 'proportional', 'equal', or 'derived'")
             if self.num_inducing < 1:
                 raise ValueError("num_inducing must be >= 1")
 
@@ -554,7 +601,8 @@ class PNMF:
         gp.Lu = CholeskyParameter(
             (L, M), mode=self.cholesky_mode, diagonal_only=self.diagonal_only
         )
-        Lu_init = torch.zeros(L, M, M)
+        Lu_init = torch.randn(L, M, M) * 1e-2
+        Lu_init = torch.tril(Lu_init)
         Lu_init[:, range(M), range(M)] = torch.rand(L, M)
         gp.Lu.data = Lu_init
         gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)

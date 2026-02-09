@@ -131,6 +131,18 @@ class TestSpatialFit:
             model.fit(X, coordinates=coords, groups=groups)
             assert model.components_.shape == (2, 20)
 
+    def test_fit_spatial_derived_allocation(self, small_spatial_data):
+        """Test derived inducing point allocation (K-means on all data + KNN classification)."""
+        X, coords, groups = small_spatial_data
+        model = PNMF(
+            n_components=2, spatial=True,
+            inducing_allocation='derived',  # New mode
+            max_iter=3, num_inducing=15, random_state=42,
+        )
+        model.fit(X, coordinates=coords, groups=groups)
+        assert model.components_.shape == (2, 20)
+        assert model.elbo_ is not None
+
 
 class TestSpatialBatching:
     """Test spatial mode with mini-batching."""
