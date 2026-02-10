@@ -25,7 +25,9 @@ Probabilistic-NMF/
 ├── tests/                   # Test suite
 │   ├── __init__.py
 │   ├── test_pnmf.py         # Pytest tests for core components
-│   └── test_transforms.py   # Pytest tests for transforms module
+│   ├── test_transforms.py   # Pytest tests for transforms module
+│   ├── test_spatial.py      # Pytest tests for spatial SVGP mode
+│   └── test_spatial_training.py  # Training integration tests for spatial mode
 ├── benchmarks/              # Benchmark scripts and notebooks
 │   ├── README.md            # Benchmark documentation
 │   ├── simple_vs_expanded.py    # Standalone benchmark script
@@ -59,10 +61,21 @@ The following components were adapted from [GPzoo](https://github.com/luisdiaz19
 - `GaussianPrior` class - Variational distribution with mean/scale parameters
 - Returns (qF, pF) for ELBO computation
 - **NEW**: Now supports natural gradient parameterization (`use_natural_gradients=True`)
+- `MGGP_SVGP` / `SVGP` - Sparse Variational GP (used as spatial prior)
 
 **From `gpzoo/likelihoods.py`:**
 - `PoissonFactorization` base class - Variational Poisson factorization
 - Removed the `V` parameter (sample-specific scaling) for simplicity
+
+**From `gpzoo/kernels.py`:**
+- `batched_MGGP_Matern32` - Multi-group GP Matern 3/2 kernel (for spatial mode)
+- `batched_Matern32` - Standard batched Matern 3/2 kernel
+
+**From `gpzoo/modules.py`:**
+- `CholeskyParameter` - Constrained Cholesky factor parameterization (for SVGP variational covariance)
+
+**From `gpzoo/model_utilities.py`:**
+- `mggp_kmeans_inducing_points()` - K-means based inducing point selection for multi-group GPs
 
 ### 3. Architecture: Variational Inference
 
@@ -81,7 +94,92 @@ where:
 - For sklearn API: X (n_samples, n_features) ≈ exp(F) (n_samples, n_components) @ W.T (n_components, n_features)
 - Internal representation: X (D, N) ≈ W (D, L) @ exp(F) (L, N)
 
-### 4. Key Features Implemented
+### 4. Spatial Mode (SVGP Prior)
+
+When `spatial=True`, the latent factors F are modeled by a **Sparse Variational Gaussian Process (SVGP)** over spatial coordinates instead of an independent Gaussian prior. Uses the **MGGP** (Multi-Group GP) variant with `batched_MGGP_Matern32` kernel from GPzoo for group-aware spatial smoothing.
+
+**Key idea**: Replace `GaussianPrior` (independent per-sample) with `MGGP_SVGP` (spatially correlated, group-aware) while keeping the same `PoissonFactorization` likelihood and ELBO framework.
+
+**Spatial API:**
+```python
+from PNMF import PNMF
+
+model = PNMF(
+    n_components=10,
+    spatial=True,                # Enables GP prior
+    # GP-specific parameters
+    num_inducing=3000,          # M: number of inducing points
+    lengthscale=1.0,            # Kernel lengthscale
+    sigma=1.0,                  # Kernel output scale
+    group_diff_param=10.0,      # MGGP group difference parameter
+    jitter=1e-5,                # Numerical stability
+    train_lengthscale=False,    # Freeze lengthscale (default)
+    # Standard PNMF parameters
+    mode='expanded',
+    max_iter=500,
+    learning_rate=0.01,
+    batch_size=1000,            # Mini-batching for large N
+    y_batch_size=500,           # Feature batching
+)
+
+# spatial=True requires coordinates and groups
+history, model = model.fit(
+    X,                          # (N, D) count matrix
+    coordinates=coordinates,    # (N, 2) spatial coordinates - REQUIRED
+    groups=groups,              # (N,) integer group codes - REQUIRED when multigroup=True
+    return_history=True,
+)
+
+# Transform new data with spatial coordinates
+transformed = model.transform(X_new, coordinates=coords_new, groups=groups_new)
+```
+
+**Spatial Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `spatial` | `False` | Enable spatial GP prior |
+| `prior` | `'GaussianPrior'` | Auto-set to `'SVGP'` when `spatial=True` |
+| `kernel` | `'Matern32'` | Kernel function |
+| `multigroup` | `True` | Use MGGP (multi-group GP) |
+| `num_inducing` | `3000` | Number of inducing points M |
+| `lengthscale` | `1.0` | Kernel lengthscale |
+| `sigma` | `1.0` | Kernel output scale |
+| `group_diff_param` | `10.0` | Group difference scaling |
+| `jitter` | `1e-5` | Numerical stability |
+| `train_lengthscale` | `False` | Whether to train kernel lengthscale |
+| `cholesky_mode` | `'exp'` | Cholesky diagonal constraint |
+| `diagonal_only` | `False` | Diagonal-only variational covariance |
+| `inducing_allocation` | `'proportional'` | How to distribute inducing points across groups |
+
+**Architecture differences (spatial vs non-spatial):**
+
+| Aspect | GaussianPrior | MGGP_SVGP |
+|--------|--------------|-----------|
+| Parameters | mu (L,N), sigma (L,N) | mu (L,M), Lu (L,M,M), Z (M,2), kernel params |
+| Forward input | None (or idx) | coordinates (N,2), groups (N,) |
+| Forward output | (qF, pF) | (qF, qU, pU) |
+| KL divergence | Gaussian KL, scales with N/batch_size | Whitened KL on inducing points, no N-scaling |
+| Mini-batch | Index into mu/sigma columns | Pass coordinate subset to GP forward |
+| transform() | NNLS multiplicative updates | GP predictive at new coordinates |
+| Dependency | PyTorch only | PyTorch + GPzoo (lazy import) |
+
+**ELBO for spatial mode:**
+```
+ELBO = E[log p(Y|F)] - KL(q(U) || p(U))
+```
+- Expected log-likelihood uses the **same three modes** (simple/expanded/lower-bound) — the GP predictive qF is still Normal
+- KL is the whitened KL on inducing points via `gp.kl_divergence(qU, pU)`, NOT scaled by N/batch_size
+- `elbo.py` is unchanged — only the KL source differs
+
+**Initialization:**
+- **W**: Data-aware initialization shared by both spatial and non-spatial (`_initialize_W()`)
+- **Inducing points Z**: K-means selection via `mggp_kmeans_inducing_points()` (critical for GP quality)
+- **mu (inducing means)**: Random `N(0, 1)` scale (spatial uses `_create_spatial_prior()`, non-spatial uses `_initialize_mu_nonspatial()`)
+- **Lu (Cholesky)**: Random diagonal initialization via `CholeskyParameter`
+
+
+### 5. Key Features Implemented
 
 **sklearn-compatible API:**
 ```python
@@ -121,12 +219,12 @@ rate, qF, pF = model(E=3)  # Returns rate tensor and distributions
 - `learning_rate`: 0.01
 - `optimizer`: `'Adam'` (Adam, AdamW, NAdam, SGD, RMSprop)
 
-### 5. Installation
+### 6. Installation
 
 **PyPI package name:** `pnmf` (lowercase)
 **Python import:** `from PNMF import PNMF` (uppercase)
 
-### 6. License
+### 7. License
 
 - **License:** GNU General Public License v2.0 (GPL-2.0)
 - **Author:** Luis Chumpitaz Diaz
@@ -255,13 +353,20 @@ See the **ELBO Computation Modes** section above for details on how the expected
 **PoissonFactorization** (`models.py`)
 - PyTorch nn.Module
 - Has W (PositiveParameter) for loadings
-- `forward(E=3)` returns (rate, qF, pF)
+- `forward(E=3)` returns (terms, qF, pF) for non-spatial, (terms, qF, qU, pU) for spatial
+- Accepts `coordinates`, `groups`, `spatial` args to branch between GaussianPrior and GP forward
 
 **PNMF** (`models.py`)
 - sklearn-compatible wrapper
-- Creates GaussianPrior internally
+- Creates GaussianPrior (non-spatial) or MGGP_SVGP (spatial) internally
 - Uses ELBO loss instead of NLL
-- `training_mode` parameter: `'standard'` or `'natural'`
+- `training_mode` parameter: `'standard'` or `'natural'` (natural not supported with spatial)
+- `spatial` parameter enables GP prior mode
+- Key internal methods:
+  - `_create_spatial_prior()` — builds MGGP_SVGP with kernel, inducing points, batched mu/Lu
+  - `_initialize_W()` — shared W initialization for both spatial and non-spatial
+  - `_initialize_mu_nonspatial()` — variational mean init for non-spatial models
+  - `_create_optimizer()` — optimizer factory (replaces duplicated code)
 
 ### PositiveParameter Class
 
@@ -317,6 +422,13 @@ The test suite covers:
 - **TestELBOFunctions**: Direct testing of ELBO computation functions
 - **TestPyTorchAPI**: PyTorch-native API (PoissonFactorization, GaussianPrior)
 - **TestParameterValidation**: Input validation and error handling
+- **TestSpatialValidation**: Spatial parameter validation (requires coords, groups, etc.)
+- **TestSpatialFit**: Basic spatial fitting (multigroup, single-group, batching)
+- **TestSpatialTransform**: Spatial transform and fit_transform
+- **TestSpatialFactorExtraction**: Factor extraction functions with spatial models
+- **TestSpatialTraining**: Training integration tests for spatial mode (convergence, ELBO modes)
+
+Spatial tests require `gpzoo` and are auto-skipped if not installed (`@pytest.mark.skipif`).
 
 ### Quick Verification
 
@@ -409,12 +521,44 @@ The `.readthedocs.yaml` file configures automatic builds on Read the Docs:
 Potential improvements:
 - Fix SGD optimizer divergence (add gradient clipping or per-parameter learning rates)
 - Add more initialization methods (e.g., 'nndsvd', 'k-means')
-- Implement online/mini-batch learning
 - Add support for sparse matrices
-- Include more unit tests
 - Add benchmarking against sklearn NMF
+- GP regression-based μ initialization for spatial mode (Option 3 from SVGP_INITIALIZATION.md — needed for NNDSVD/k-means init in spatial)
+- Initialize Lu from Kzz structure for spatial mode
+- Support additional GP kernels beyond Matern32
+- Train kernel hyperparameters (currently sigma and group_diff_param are frozen)
 
 ## Recent Changes
+
+### 2025-02: Add SVGP Spatial Prior Support (Branch: SVGP)
+
+**What was changed:**
+- Added `spatial=True` mode to PNMF using SVGP (Sparse Variational GP) from GPzoo as an alternative prior
+- Added spatial parameters to PNMF constructor: `spatial`, `prior`, `kernel`, `multigroup`, `num_inducing`, `lengthscale`, `sigma`, `group_diff_param`, `jitter`, `train_lengthscale`, `cholesky_mode`, `diagonal_only`, `inducing_allocation`
+- Added `coordinates` and `groups` arguments to `fit()`, `transform()`, `fit_transform()`
+- Added `_create_spatial_prior()` method that builds MGGP_SVGP with kernel, k-means inducing points, and batched variational parameters
+- Adapted `PoissonFactorization.forward()` to handle both GaussianPrior and GP prior (returns different tuples)
+- Adapted training loop: spatial uses whitened KL on inducing points (no N-scaling), non-spatial uses Gaussian KL
+- Adapted mini-batching: spatial passes coordinate subsets to GP, non-spatial indexes into mu/sigma
+- Updated `PNMF/transforms.py`: all factor extraction functions (`log_factors`, `get_factors`, `factor_uncertainty`, `factor_samples`) now support spatial models via `_get_spatial_qF()` helper
+- Added `spatial` optional dependency in `pyproject.toml` (gpzoo + faiss-cpu)
+- Refactored `_initialize_parameters()` into `_initialize_W()` (shared) + `_initialize_mu_nonspatial()` (non-spatial only)
+- Improved spatial initialization: mu scale from `0.01` to `1.0`, random diagonal Lu init
+- Extracted `_create_optimizer()` helper to eliminate duplicated optimizer creation code
+- Added validation rules for spatial parameters in `_validate_params()`
+- Created `tests/test_spatial.py` (validation, fitting, transform, factor extraction)
+- Created `tests/test_spatial_training.py` (training convergence, ELBO modes)
+
+**Files modified:**
+- `PNMF/models.py` — PNMF `__init__`, `fit()`, `transform()`, `fit_transform()`, `_validate_params()`, `PoissonFactorization.forward()`, new methods `_create_spatial_prior()`, `_initialize_W()`, `_initialize_mu_nonspatial()`, `_create_optimizer()`
+- `PNMF/transforms.py` — Added `_get_spatial_qF()`, updated `log_factors()`, `get_factors()`, `factor_uncertainty()`, `factor_samples()` with `coordinates`/`groups` params
+- `pyproject.toml` — Added `[project.optional-dependencies] spatial`
+
+**Files NOT changed:**
+- `PNMF/elbo.py` — Works with any Normal qF, no changes needed
+- `PNMF/priors.py` — GaussianPrior unchanged
+- `PNMF/custom_modules.py` — No changes needed
+- `PNMF/optimizers.py` — NGD not used with spatial
 
 ### 2025-01-27: Add General Transforms and Utility Functions
 

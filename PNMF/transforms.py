@@ -21,7 +21,56 @@ from .priors import GaussianPrior
 # Factor Extraction Functions
 # =============================================================================
 
-def log_factors(model, return_tensor: bool = False) -> Union[np.ndarray, torch.Tensor]:
+def _get_spatial_qF(model, coordinates=None, groups=None):
+    """
+    Get the variational distribution qF from a spatial model.
+
+    For spatial models, runs the GP forward pass with the given or stored
+    coordinates to produce the predictive distribution qF.
+
+    Args:
+        model: Fitted PNMF model with spatial=True.
+        coordinates: Optional coordinates override. If None, uses stored training coords.
+        groups: Optional groups override. If None, uses stored training groups.
+
+    Returns:
+        qF: Normal distribution with .mean and .scale of shape (L, N).
+    """
+    coords = coordinates if coordinates is not None else model._coordinates
+    grps = groups if groups is not None else model._groups
+
+    if coords is None:
+        raise ValueError("No coordinates available. Pass coordinates or fit with spatial=True.")
+
+    # Determine device from the prior parameters
+    device = next(model._prior.parameters()).device
+
+    # Convert numpy arrays to tensors if needed
+    if isinstance(coords, np.ndarray):
+        coords = torch.from_numpy(coords.astype(np.float32)).to(device)
+    elif coords.device != device:
+        coords = coords.to(device)
+
+    if grps is not None:
+        if isinstance(grps, np.ndarray):
+            grps = torch.from_numpy(grps.astype(np.int64)).to(device)
+        elif grps.device != device:
+            grps = grps.to(device)
+
+    with torch.no_grad():
+        if grps is not None:
+            qF, _, _ = model._prior(X=coords, groupsX=grps)
+        else:
+            qF, _, _ = model._prior(X=coords)
+    return qF
+
+
+def log_factors(
+    model,
+    coordinates=None,
+    groups=None,
+    return_tensor: bool = False,
+) -> Union[np.ndarray, torch.Tensor]:
     """
     Get log-space latent factors (μ from q(F) = Normal(μ, σ²)).
 
@@ -29,6 +78,12 @@ def log_factors(model, return_tensor: bool = False) -> Union[np.ndarray, torch.T
     ----------
     model : PNMF
         A fitted PNMF model.
+    coordinates : array-like, optional
+        Spatial coordinates. For spatial models, uses stored training
+        coordinates if not provided.
+    groups : array-like, optional
+        Group assignments. For spatial models, uses stored training
+        groups if not provided.
     return_tensor : bool, default=False
         If True, return a torch.Tensor instead of numpy array.
 
@@ -47,14 +102,13 @@ def log_factors(model, return_tensor: bool = False) -> Union[np.ndarray, torch.T
     if model._prior is None:
         raise ValueError("Model has not been fitted yet.")
 
-    # Get mean from the variational distribution
-    # Prior stores it as (L, N), we transpose to (N, L) for sklearn-style output
-    if model._prior.use_natural_gradients:
+    if getattr(model, 'spatial', False):
+        qF = _get_spatial_qF(model, coordinates, groups)
+        mu = qF.mean.detach()
+    elif model._prior.use_natural_gradients:
         # Natural parameterization: convert to mean
         theta1 = model._prior.theta1.detach()
         theta2 = model._prior.theta2.detach()
-        # mu = theta1 / (-2 * theta2) = theta1 * s^2
-        # s^2 = -1 / (2 * theta2)
         s_sq = -1 / (2 * theta2)
         mu = theta1 * s_sq
     else:
@@ -71,6 +125,8 @@ def log_factors(model, return_tensor: bool = False) -> Union[np.ndarray, torch.T
 def get_factors(
     model,
     use_mgf: bool = False,
+    coordinates=None,
+    groups=None,
     return_tensor: bool = False
 ) -> Union[np.ndarray, torch.Tensor]:
     """
@@ -86,6 +142,10 @@ def get_factors(
     use_mgf : bool, default=False
         If True, compute E[exp(F)] = exp(μ + σ²/2) using the MGF.
         If False, compute exp(μ) directly.
+    coordinates : array-like, optional
+        Spatial coordinates (for spatial models).
+    groups : array-like, optional
+        Group assignments (for spatial models).
     return_tensor : bool, default=False
         If True, return a torch.Tensor instead of numpy array.
 
@@ -113,8 +173,11 @@ def get_factors(
     if model._prior is None:
         raise ValueError("Model has not been fitted yet.")
 
-    # Get mean and scale from the variational distribution
-    if model._prior.use_natural_gradients:
+    if getattr(model, 'spatial', False):
+        qF = _get_spatial_qF(model, coordinates, groups)
+        mu = qF.mean.detach()
+        scale_sq = (qF.scale.detach()) ** 2
+    elif model._prior.use_natural_gradients:
         theta1 = model._prior.theta1.detach()
         theta2 = model._prior.theta2.detach()
         s_sq = -1 / (2 * theta2)
@@ -143,6 +206,8 @@ def get_factors(
 def factor_uncertainty(
     model,
     return_variance: bool = False,
+    coordinates=None,
+    groups=None,
     return_tensor: bool = False
 ) -> Union[np.ndarray, torch.Tensor]:
     """
@@ -154,6 +219,10 @@ def factor_uncertainty(
         A fitted PNMF model.
     return_variance : bool, default=False
         If True, return variance (σ²). If False, return standard deviation (σ).
+    coordinates : array-like, optional
+        Spatial coordinates (for spatial models).
+    groups : array-like, optional
+        Group assignments (for spatial models).
     return_tensor : bool, default=False
         If True, return a torch.Tensor instead of numpy array.
 
@@ -173,8 +242,14 @@ def factor_uncertainty(
     if model._prior is None:
         raise ValueError("Model has not been fitted yet.")
 
-    # Get scale from the variational distribution
-    if model._prior.use_natural_gradients:
+    if getattr(model, 'spatial', False):
+        qF = _get_spatial_qF(model, coordinates, groups)
+        scale = qF.scale.detach()
+        if return_variance:
+            result = scale ** 2
+        else:
+            result = scale
+    elif model._prior.use_natural_gradients:
         theta2 = model._prior.theta2.detach()
         s_sq = -1 / (2 * theta2)
         if return_variance:
@@ -200,6 +275,8 @@ def factor_samples(
     model,
     n_samples: int = 100,
     return_exp: bool = False,
+    coordinates=None,
+    groups=None,
     return_tensor: bool = False
 ) -> Union[np.ndarray, torch.Tensor]:
     """
@@ -213,6 +290,10 @@ def factor_samples(
         Number of samples to draw.
     return_exp : bool, default=False
         If True, return exp(F) samples. If False, return F samples.
+    coordinates : array-like, optional
+        Spatial coordinates (for spatial models).
+    groups : array-like, optional
+        Group assignments (for spatial models).
     return_tensor : bool, default=False
         If True, return a torch.Tensor instead of numpy array.
 
@@ -237,7 +318,10 @@ def factor_samples(
         raise ValueError("Model has not been fitted yet.")
 
     # Get the variational distribution
-    qF, _ = model._prior()
+    if getattr(model, 'spatial', False):
+        qF = _get_spatial_qF(model, coordinates, groups)
+    else:
+        qF, _ = model._prior()
 
     # Sample using reparameterization trick
     # qF.rsample returns shape (n_samples, L, N)
