@@ -228,6 +228,20 @@ class PNMF:
         - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
           otherwise 'random'.
 
+    scheduler : {'plateau', None}, default='plateau'
+        Learning rate scheduler:
+        - 'plateau': ReduceLROnPlateau, reduces LR when ELBO plateaus
+        - None: No scheduler (constant learning rate)
+
+    scheduler_patience : int, default=50
+        Number of iterations with no improvement before reducing LR.
+
+    scheduler_factor : float, default=0.5
+        Factor by which to reduce LR (new_lr = old_lr * factor).
+
+    min_lr : float, default=1e-6
+        Minimum learning rate. Scheduler won't reduce below this.
+
     batch_size : int, default=None
         Size of mini-batches for samples (N dimension). If None, uses full batch.
         Enable mini-batch training for large datasets.
@@ -335,6 +349,10 @@ class PNMF:
         verbose: bool = False,
         device: str = 'auto',
         init: Optional[str] = 'random',
+        scheduler: Optional[str] = 'plateau',
+        scheduler_patience: int = 50,
+        scheduler_factor: float = 0.5,
+        min_lr: float = 1e-6,
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
         shuffle: bool = True,
@@ -368,6 +386,10 @@ class PNMF:
         self.verbose = verbose
         self.device = device
         self.init = init
+        self.scheduler = scheduler
+        self.scheduler_patience = scheduler_patience
+        self.scheduler_factor = scheduler_factor
+        self.min_lr = min_lr
         self.batch_size = batch_size
         self.y_batch_size = y_batch_size
         self.shuffle = shuffle
@@ -401,6 +423,8 @@ class PNMF:
         self._prior = None
         self._optimizer = None
         self._w_optimizer = None
+        self._scheduler = None
+        self._w_scheduler = None
         self._coordinates = None
         self._groups = None
 
@@ -438,6 +462,9 @@ class PNMF:
             raise ValueError(
                 f"init must be one of {valid_init_options}, got '{self.init}'"
             )
+
+        if self.scheduler is not None and self.scheduler not in ['plateau']:
+            raise ValueError("scheduler must be 'plateau' or None")
 
         if self.batch_size is not None and self.batch_size < 1:
             raise ValueError("batch_size must be >= 1 or None")
@@ -838,9 +865,34 @@ class PNMF:
             self._optimizer = self._create_optimizer(params)
             self._w_optimizer = None
 
+        # Create learning rate schedulers
+        if self.scheduler == 'plateau':
+            self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self._optimizer,
+                mode='max',  # maximize ELBO
+                factor=self.scheduler_factor,
+                patience=self.scheduler_patience,
+                min_lr=self.min_lr,
+            )
+            if self._w_optimizer is not None:
+                self._w_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self._w_optimizer,
+                    mode='max',
+                    factor=self.scheduler_factor,
+                    patience=self.scheduler_patience,
+                    min_lr=self.min_lr,
+                )
+        else:
+            self._scheduler = None
+            self._w_scheduler = None
+
         # Training loop
         prev_elbo = float('-inf')
         elbo_history = [] if return_history else None
+        # Exponential moving average of ELBO for scheduler (smooths noise)
+        ema_elbo = None
+        ema_alpha = 0.05  # smoothing factor
+        prev_lr = self.learning_rate  # track LR for logging reductions
 
         # Determine if we're using batched training
         use_batching = self.batch_size is not None or self.y_batch_size is not None
@@ -960,13 +1012,35 @@ class PNMF:
             if return_history:
                 elbo_history.append(elbo_value)
 
+            # Update EMA of ELBO and step scheduler
+            if ema_elbo is None:
+                ema_elbo = elbo_value
+            else:
+                ema_elbo = ema_alpha * elbo_value + (1 - ema_alpha) * ema_elbo
+
+            if self._scheduler is not None:
+                self._scheduler.step(ema_elbo)
+            if self._w_scheduler is not None:
+                self._w_scheduler.step(ema_elbo)
+
+            # Get current learning rate for display
+            current_lr = self._optimizer.param_groups[0]['lr']
+
+            # Log LR reduction events
+            if self._scheduler is not None and current_lr < prev_lr:
+                if self.verbose:
+                    print(f"Iteration {iteration}: Reducing lr: {prev_lr:.2e} -> {current_lr:.2e}")
+                else:
+                    pbar.write(f"Iteration {iteration}: Reducing lr: {prev_lr:.2e} -> {current_lr:.2e}")
+                prev_lr = current_lr
+
             if self.verbose:
                 # Use print statements for verbose mode
                 if iteration % 10 == 0:
                     print(f"Iteration {iteration}: ELBO = {elbo_value:.6f}")
             else:
-                # Update tqdm progress bar with ELBO
-                pbar.set_postfix({"ELBO": f"{elbo_value:.6f}"})
+                # Update tqdm progress bar with ELBO and LR
+                pbar.set_postfix({"ELBO": f"{elbo_value:.6f}", "lr": f"{current_lr:.1e}"})
 
             if abs(elbo_value - prev_elbo) < self.tol:
                 if self.verbose:
