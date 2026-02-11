@@ -87,7 +87,7 @@ class TestSpatialFit:
     def test_fit_spatial_multigroup(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -110,7 +110,7 @@ class TestSpatialFit:
     def test_fit_spatial_with_history(self, small_spatial_data):
         X, coords, groups = small_spatial_data
         model = PNMF(
-            n_components=2, spatial=True, max_iter=5,
+            n_components=2, spatial=True, multigroup=True, max_iter=5,
             num_inducing=15, random_state=42,
         )
         history, model = model.fit(
@@ -125,7 +125,7 @@ class TestSpatialFit:
         X, coords, groups = small_spatial_data
         for mode in ['simple', 'expanded', 'lower-bound']:
             model = PNMF(
-                n_components=2, spatial=True, mode=mode,
+                n_components=2, spatial=True, multigroup=True, mode=mode,
                 max_iter=3, num_inducing=15, random_state=42,
             )
             model.fit(X, coordinates=coords, groups=groups)
@@ -135,7 +135,7 @@ class TestSpatialFit:
         """Test derived inducing point allocation (K-means on all data + KNN classification)."""
         X, coords, groups = small_spatial_data
         model = PNMF(
-            n_components=2, spatial=True,
+            n_components=2, spatial=True, multigroup=True,
             inducing_allocation='derived',  # New mode
             max_iter=3, num_inducing=15, random_state=42,
         )
@@ -150,7 +150,7 @@ class TestSpatialBatching:
     def test_spatial_with_sample_batching(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, batch_size=30, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -159,7 +159,7 @@ class TestSpatialBatching:
     def test_spatial_with_feature_batching(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, y_batch_size=20, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -168,7 +168,7 @@ class TestSpatialBatching:
     def test_spatial_with_both_batching(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, batch_size=30, y_batch_size=20,
             random_state=42,
         )
@@ -182,7 +182,7 @@ class TestSpatialTransform:
     def test_transform_spatial(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -195,7 +195,7 @@ class TestSpatialTransform:
     def test_transform_new_coordinates(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -212,7 +212,7 @@ class TestSpatialTransform:
     def test_transform_requires_coordinates(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, random_state=42,
         )
         model.fit(X, coordinates=coords, groups=groups)
@@ -223,7 +223,7 @@ class TestSpatialTransform:
     def test_fit_transform_spatial(self, spatial_data):
         X, coords, groups = spatial_data
         model = PNMF(
-            n_components=3, spatial=True, max_iter=5,
+            n_components=3, spatial=True, multigroup=True, max_iter=5,
             num_inducing=20, random_state=42,
         )
         transformed = model.fit_transform(X, coordinates=coords, groups=groups)
@@ -237,7 +237,7 @@ class TestSpatialFactorExtraction:
     def setup_model(self, small_spatial_data):
         X, coords, groups = small_spatial_data
         self.model = PNMF(
-            n_components=2, spatial=True, max_iter=5,
+            n_components=2, spatial=True, multigroup=True, max_iter=5,
             num_inducing=15, random_state=42,
         )
         self.model.fit(X, coordinates=coords, groups=groups)
@@ -300,3 +300,130 @@ class TestSpatialFactorExtraction:
         """log_factors should work without explicit coordinates (uses stored ones)."""
         F_log = log_factors(self.model)
         assert F_log.shape == (30, 2)
+
+
+class TestSpatialNoGroups:
+    """Test spatial SVGP without groups (batched_Matern32 kernel)."""
+
+    @pytest.fixture
+    def no_group_data(self):
+        """Spatial data without group labels."""
+        np.random.seed(42)
+        N, D = 80, 40
+        X = np.random.poisson(5, (N, D)).astype(np.float32)
+        coords = np.random.randn(N, 2).astype(np.float32)
+        return X, coords
+
+    def test_fit_no_groups(self, no_group_data):
+        """Fit spatial model without groups (default multigroup=False)."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=5,
+            num_inducing=20, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+
+        assert model.components_.shape == (3, 40)
+        assert model.elbo_ is not None
+        assert model.n_iter_ > 0
+
+    def test_transform_no_groups(self, no_group_data):
+        """Transform with spatial model, no groups."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=5,
+            num_inducing=20, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+
+        # Transform at same coordinates
+        transformed = model.transform(X, coordinates=coords)
+        assert transformed.shape == (80, 3)
+        assert np.all(transformed > 0)
+
+    def test_transform_new_coords_no_groups(self, no_group_data):
+        """Transform at new coordinates, no groups."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=5,
+            num_inducing=20, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+
+        new_coords = np.random.randn(15, 2).astype(np.float32)
+        new_X = np.random.poisson(5, (15, 40)).astype(np.float32)
+        transformed = model.transform(new_X, coordinates=new_coords)
+        assert transformed.shape == (15, 3)
+
+    def test_fit_transform_no_groups(self, no_group_data):
+        """fit_transform without groups."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=5,
+            num_inducing=20, random_state=42,
+        )
+        transformed = model.fit_transform(X, coordinates=coords)
+        assert transformed.shape == (80, 3)
+
+    def test_elbo_modes_no_groups(self, no_group_data):
+        """All ELBO modes work without groups."""
+        X, coords = no_group_data
+        for mode in ['simple', 'expanded', 'lower-bound']:
+            model = PNMF(
+                n_components=2, spatial=True, mode=mode,
+                max_iter=3, num_inducing=15, random_state=42,
+            )
+            model.fit(X, coordinates=coords)
+            assert model.components_.shape == (2, 40)
+
+    def test_kmeans_inducing_points(self, no_group_data):
+        """Verify inducing points are K-means centroids, not random."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=1,
+            num_inducing=10, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+
+        Z = model._prior.Z.detach().cpu().numpy()
+        assert Z.shape == (10, 2)
+
+        # Inducing points should NOT be a subset of the original coordinates
+        # (K-means centroids are averages, not data points)
+        coords_set = set(map(tuple, coords))
+        z_set = set(map(tuple, Z))
+        # At least some centroids should differ from original data points
+        assert not z_set.issubset(coords_set)
+
+    def test_batching_no_groups(self, no_group_data):
+        """Mini-batching works without groups."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=3, spatial=True, max_iter=5,
+            num_inducing=20, batch_size=20, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+        assert model.components_.shape == (3, 40)
+
+    def test_factor_extraction_no_groups(self, no_group_data):
+        """Factor extraction functions work without groups."""
+        X, coords = no_group_data
+        model = PNMF(
+            n_components=2, spatial=True, max_iter=5,
+            num_inducing=15, random_state=42,
+        )
+        model.fit(X, coordinates=coords)
+
+        F_log = log_factors(model, coordinates=coords)
+        assert F_log.shape == (80, 2)
+
+        F_exp = get_factors(model, coordinates=coords)
+        assert F_exp.shape == (80, 2)
+        assert np.all(F_exp > 0)
+
+        F_std = factor_uncertainty(model, coordinates=coords)
+        assert F_std.shape == (80, 2)
+        assert np.all(F_std > 0)
+
+        samples = factor_samples(model, n_samples=5, coordinates=coords)
+        assert samples.shape == (5, 80, 2)

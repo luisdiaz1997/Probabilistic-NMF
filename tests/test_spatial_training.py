@@ -19,6 +19,7 @@ def test_spatial_parameters_trained():
     model = PNMF(
         n_components=L,
         spatial=True,
+        multigroup=True,
         num_inducing=10,
         max_iter=100,
         learning_rate=0.01,
