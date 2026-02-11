@@ -228,19 +228,35 @@ class PNMF:
         - None: Auto-select 'nndsvda' if n_components <= min(n_samples, n_features),
           otherwise 'random'.
 
-    scheduler : {'plateau', None}, default='plateau'
+    scheduler : {'one_cycle', 'plateau', None}, default='one_cycle'
         Learning rate scheduler:
+        - 'one_cycle': OneCycleLR with warmup then cosine annealing (default)
         - 'plateau': ReduceLROnPlateau, reduces LR when ELBO plateaus
         - None: No scheduler (constant learning rate)
 
-    scheduler_patience : int, default=50
+    scheduler_patience : int, default=200
         Number of iterations with no improvement before reducing LR.
+        Only used when scheduler='plateau'.
 
-    scheduler_factor : float, default=0.5
+    scheduler_factor : float, default=0.8
         Factor by which to reduce LR (new_lr = old_lr * factor).
+        Only used when scheduler='plateau'.
 
-    min_lr : float, default=1e-6
-        Minimum learning rate. Scheduler won't reduce below this.
+    scheduler_pct_start : float, default=0.3
+        Fraction of total iterations spent in warmup phase (LR ramps up
+        from learning_rate/div_factor to learning_rate). Only used when
+        scheduler='one_cycle'.
+
+    scheduler_div_factor : float, default=25.0
+        Determines initial LR: initial_lr = learning_rate / div_factor.
+        Only used when scheduler='one_cycle'.
+
+    scheduler_final_div_factor : float, default=1e4
+        Determines final LR: min_lr = initial_lr / final_div_factor.
+        Only used when scheduler='one_cycle'.
+
+    min_lr : float, default=1e-5
+        Minimum learning rate. Only used when scheduler='plateau'.
 
     batch_size : int, default=None
         Size of mini-batches for samples (N dimension). If None, uses full batch.
@@ -349,10 +365,13 @@ class PNMF:
         verbose: bool = False,
         device: str = 'auto',
         init: Optional[str] = 'random',
-        scheduler: Optional[str] = 'plateau',
-        scheduler_patience: int = 50,
-        scheduler_factor: float = 0.5,
-        min_lr: float = 1e-6,
+        scheduler: Optional[str] = 'one_cycle',
+        scheduler_patience: int = 200,
+        scheduler_factor: float = 0.8,
+        scheduler_pct_start: float = 0.3,
+        scheduler_div_factor: float = 25.0,
+        scheduler_final_div_factor: float = 1e4,
+        min_lr: float = 1e-5,
         batch_size: Optional[int] = None,
         y_batch_size: Optional[int] = None,
         shuffle: bool = True,
@@ -389,6 +408,9 @@ class PNMF:
         self.scheduler = scheduler
         self.scheduler_patience = scheduler_patience
         self.scheduler_factor = scheduler_factor
+        self.scheduler_pct_start = scheduler_pct_start
+        self.scheduler_div_factor = scheduler_div_factor
+        self.scheduler_final_div_factor = scheduler_final_div_factor
         self.min_lr = min_lr
         self.batch_size = batch_size
         self.y_batch_size = y_batch_size
@@ -463,8 +485,8 @@ class PNMF:
                 f"init must be one of {valid_init_options}, got '{self.init}'"
             )
 
-        if self.scheduler is not None and self.scheduler not in ['plateau']:
-            raise ValueError("scheduler must be 'plateau' or None")
+        if self.scheduler is not None and self.scheduler not in ['one_cycle', 'plateau']:
+            raise ValueError("scheduler must be 'one_cycle', 'plateau', or None")
 
         if self.batch_size is not None and self.batch_size < 1:
             raise ValueError("batch_size must be >= 1 or None")
@@ -866,7 +888,28 @@ class PNMF:
             self._w_optimizer = None
 
         # Create learning rate schedulers
-        if self.scheduler == 'plateau':
+        if self.scheduler == 'one_cycle':
+            # NaturalGradientDescent doesn't support momentum, so disable cycle_momentum
+            needs_no_momentum = isinstance(self._optimizer, NaturalGradientDescent)
+            self._scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self._optimizer,
+                max_lr=self.learning_rate,
+                total_steps=self.max_iter,
+                pct_start=self.scheduler_pct_start,
+                div_factor=self.scheduler_div_factor,
+                final_div_factor=self.scheduler_final_div_factor,
+                cycle_momentum=not needs_no_momentum,
+            )
+            if self._w_optimizer is not None:
+                self._w_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    self._w_optimizer,
+                    max_lr=self.learning_rate,
+                    total_steps=self.max_iter,
+                    pct_start=self.scheduler_pct_start,
+                    div_factor=self.scheduler_div_factor,
+                    final_div_factor=self.scheduler_final_div_factor,
+                )
+        elif self.scheduler == 'plateau':
             self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self._optimizer,
                 mode='max',  # maximize ELBO
@@ -1018,21 +1061,29 @@ class PNMF:
             else:
                 ema_elbo = ema_alpha * elbo_value + (1 - ema_alpha) * ema_elbo
 
-            if self._scheduler is not None:
-                self._scheduler.step(ema_elbo)
-            if self._w_scheduler is not None:
-                self._w_scheduler.step(ema_elbo)
+            if self.scheduler == 'plateau':
+                # ReduceLROnPlateau needs the metric
+                if self._scheduler is not None:
+                    self._scheduler.step(ema_elbo)
+                if self._w_scheduler is not None:
+                    self._w_scheduler.step(ema_elbo)
+            elif self.scheduler == 'one_cycle':
+                # OneCycleLR steps every iteration (no metric)
+                if self._scheduler is not None:
+                    self._scheduler.step()
+                if self._w_scheduler is not None:
+                    self._w_scheduler.step()
 
             # Get current learning rate for display
             current_lr = self._optimizer.param_groups[0]['lr']
 
-            # Log LR reduction events
-            if self._scheduler is not None and current_lr < prev_lr:
+            # Log LR reduction events (only for plateau scheduler)
+            if self.scheduler == 'plateau' and current_lr < prev_lr:
                 if self.verbose:
                     print(f"Iteration {iteration}: Reducing lr: {prev_lr:.2e} -> {current_lr:.2e}")
                 else:
                     pbar.write(f"Iteration {iteration}: Reducing lr: {prev_lr:.2e} -> {current_lr:.2e}")
-                prev_lr = current_lr
+            prev_lr = current_lr
 
             if self.verbose:
                 # Use print statements for verbose mode
