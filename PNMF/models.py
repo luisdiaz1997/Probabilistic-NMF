@@ -281,8 +281,9 @@ class PNMF:
     kernel : str, default='Matern32'
         Kernel function for spatial GP. Currently only 'Matern32' is supported.
 
-    multigroup : bool, default=True
+    multigroup : bool, default=False
         Use multi-group GP (MGGP) with group-aware spatial smoothing.
+        When False, uses standard SVGP with batched_Matern32 kernel (no groups needed).
 
     num_inducing : int, default=3000
         Number of inducing points for SVGP approximation.
@@ -379,7 +380,7 @@ class PNMF:
         spatial: bool = False,
         prior: str = 'GaussianPrior',
         kernel: str = 'Matern32',
-        multigroup: bool = True,
+        multigroup: bool = False,
         num_inducing: int = 3000,
         lengthscale: float = 1.0,
         sigma: float = 1.0,
@@ -586,7 +587,7 @@ class PNMF:
             from gpzoo.kernels import batched_MGGP_Matern32, batched_Matern32
             from gpzoo.gp import MGGP_SVGP, SVGP
             from gpzoo.modules import CholeskyParameter
-            from gpzoo.model_utilities import mggp_kmeans_inducing_points
+            from gpzoo.model_utilities import mggp_kmeans_inducing_points, kmeans_inducing_points
         except ImportError:
             raise ImportError(
                 "GPzoo is required for spatial mode. "
@@ -620,9 +621,11 @@ class PNMF:
                 allocation=self.inducing_allocation,
             )
         else:
-            # Random subset selection for non-multigroup
-            perm = torch.randperm(N)[:M]
-            Z = coordinates[perm].clone()
+            # K-means inducing point selection for non-multigroup
+            Z = kmeans_inducing_points(
+                coordinates, M,
+                seed=self.random_state or 123,
+            )
             groupsZ = None
 
         # 3. Create GP
