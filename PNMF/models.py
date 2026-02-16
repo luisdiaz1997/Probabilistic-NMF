@@ -729,7 +729,7 @@ class PNMF:
                 groupsZ = None
 
             # Compute rank for low-rank component
-            rank = self.rank if self.rank is not None else min(M, self.K + 5)
+            rank = self.rank if self.rank is not None else min(M, self.K)
 
             # 3. Create GP
             if self.multigroup and groups is not None:
@@ -752,10 +752,10 @@ class PNMF:
             del gp.Lu
             gp.Lu = LowRankPlusDiagonal(m=M, rank=rank, batch_size=L, diag_mode=self.low_rank_mode)
 
-            # Initialize V (low-rank factor) to small random values
-            # Reference: GPzoo/gpzoo/models/nsf.py:661
+            # Initialize Lu similar to SVGP: small diagonal + small random off-diagonal
             device = coordinates.device
-            gp.Lu.V.data = torch.randn(L, M, rank, device=device) * 0.01
+            gp.Lu.diag.data = torch.ones(L, 1, device=device)
+            gp.Lu.V.data = torch.randn(L, M, rank, device=device) * 1e-1
 
             # Initialize mu to small random values
             # Reference: GPzoo/gpzoo/models/nsf.py:669
