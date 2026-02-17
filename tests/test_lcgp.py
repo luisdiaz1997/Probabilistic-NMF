@@ -29,7 +29,7 @@ def lcgp_data():
 
 @pytest.fixture
 def small_lcgp_data():
-    """Even smaller data for fast tests. Uses K=3 (not 5) to work around GPzoo LCGP rank constraint."""
+    """Even smaller data for fast tests."""
     np.random.seed(123)
     N, D = 30, 15
     X = np.random.poisson(5, (N, D)).astype(np.float32)
@@ -70,18 +70,6 @@ class TestLCGPValidation:
         """K < 1 should raise error."""
         model = PNMF(spatial=True, local=True, K=0)
         with pytest.raises(ValueError, match="K must be >= 1"):
-            model._validate_params()
-
-    def test_invalid_rank_raises_error(self):
-        """rank < 1 should raise error."""
-        model = PNMF(spatial=True, local=True, rank=0)
-        with pytest.raises(ValueError, match="rank must be >= 1"):
-            model._validate_params()
-
-    def test_invalid_low_rank_mode_raises_error(self):
-        """Invalid low_rank_mode should raise error."""
-        model = PNMF(spatial=True, local=True, low_rank_mode='invalid')
-        with pytest.raises(ValueError, match="low_rank_mode must be"):
             model._validate_params()
 
     def test_natural_gradient_not_supported_lcgp(self):
@@ -185,38 +173,6 @@ class TestLCGPFit:
             model.fit(X, coordinates=coords, groups=groups)
             assert model.components_.shape == (2, 15)
             assert not np.isnan(model.elbo_)
-
-    def test_fit_lcgp_custom_rank(self, lcgp_data):
-        """Test LCGP with custom rank parameter."""
-        X, coords, _ = lcgp_data
-        model = PNMF(
-            n_components=3,
-            spatial=True,
-            local=True,
-            multigroup=False,
-            K=3,
-            rank=8,
-            max_iter=5,
-            random_state=42,
-        )
-        model.fit(X, coordinates=coords)
-        assert model.components_.shape == (3, 20)
-
-    def test_fit_lcgp_exp_low_rank_mode(self, lcgp_data):
-        """Test LCGP with exp low_rank_mode."""
-        X, coords, _ = lcgp_data
-        model = PNMF(
-            n_components=3,
-            spatial=True,
-            local=True,
-            multigroup=False,
-            K=3,
-            low_rank_mode='exp',
-            max_iter=5,
-            random_state=42,
-        )
-        model.fit(X, coordinates=coords)
-        assert model.components_.shape == (3, 20)
 
     def test_fit_lcgp_no_precompute_knn(self, lcgp_data):
         """Test LCGP with precompute_knn=False."""

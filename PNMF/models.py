@@ -331,14 +331,6 @@ class PNMF:
         Number of nearest neighbors for LCGP local conditioning.
         Only used when local=True.
 
-    rank : Optional[int], default=None
-        Rank of low-rank component for LCGP. If None, defaults to min(M, K + 5).
-        Only used when local=True.
-
-    low_rank_mode : str, default='softplus'
-        Constraint mode for LCGP LowRankPlusDiagonal.
-        Must be 'softplus' or 'exp'. Only used when local=True.
-
     precompute_knn : bool, default=True
         Whether to precompute KNN indices at initialization for LCGP.
         Only used when local=True.
@@ -418,8 +410,6 @@ class PNMF:
         inducing_allocation: str = 'proportional',
         # LCGP-specific parameters
         K: int = 50,
-        rank: Optional[int] = None,
-        low_rank_mode: str = 'softplus',
         precompute_knn: bool = True,
     ):
         self.n_components = n_components
@@ -465,8 +455,6 @@ class PNMF:
 
         # LCGP-specific parameters
         self.K = K
-        self.rank = rank
-        self.low_rank_mode = low_rank_mode
         self.precompute_knn = precompute_knn
 
         # Derive prior type from spatial and local flags
@@ -556,10 +544,6 @@ class PNMF:
             if self.local:
                 if self.K < 1:
                     raise ValueError("K must be >= 1 for LCGP")
-                if self.rank is not None and self.rank < 1:
-                    raise ValueError("rank must be >= 1 or None for LCGP")
-                if self.low_rank_mode not in ['softplus', 'exp']:
-                    raise ValueError("low_rank_mode must be 'softplus' or 'exp' for LCGP")
                 # Warn if num_inducing is set (LCGP ignores it)
                 if self.num_inducing != 3000:  # Default value
                     import warnings

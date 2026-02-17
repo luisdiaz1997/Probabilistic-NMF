@@ -501,8 +501,8 @@ The test suite covers:
 - **TestSpatialTransform**: Spatial transform and fit_transform
 - **TestSpatialFactorExtraction**: Factor extraction functions with spatial models
 - **TestSpatialTraining**: Training integration tests for spatial mode (convergence, ELBO modes)
-- **TestLCGPValidation**: LCGP parameter validation (K, rank, low_rank_mode, etc.)
-- **TestLCGPFit**: LCGP fitting (no-groups, multigroup, ELBO modes, custom rank, etc.)
+- **TestLCGPValidation**: LCGP parameter validation (K, etc.)
+- **TestLCGPFit**: LCGP fitting (no-groups, multigroup, ELBO modes, etc.)
 - **TestLCGPBatching**: LCGP with sample/feature/both mini-batching
 - **TestLCGPTransform**: LCGP transform, fit_transform, new coordinates
 - **TestLCGPFactorExtraction**: Factor extraction with LCGP (log_factors, get_factors, uncertainty, samples, loadings)
