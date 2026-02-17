@@ -33,7 +33,7 @@ tests/
 ### 2. Code Borrowed from GPzoo
 
 Components adapted from [GPzoo](https://github.com/luisdiaz1997/GPzoo):
-- `PositiveParameter`, `CholeskyParameter`, `LowRankPlusDiagonal`, `LowRankFactor` (modules.py)
+- `PositiveParameter`, `CholeskyParameter` (modules.py)
 - `GaussianPrior`, `SVGP`, `LCGP`, `MGGP_SVGP`, `MGGP_LCGP` (gp.py)
 - `batched_Matern32`, `batched_MGGP_Matern32` (kernels.py)
 - `mggp_kmeans_inducing_points()`, `kmeans_inducing_points()` (model_utilities.py)
@@ -60,7 +60,7 @@ where:
 When `spatial=True`, the latent factors F are modeled by a spatial Gaussian Process over spatial coordinates instead of an independent Gaussian prior. PNMF supports two spatial GP approximations:
 
 1. **SVGP (Sparse Variational GP)**: Uses a subset of inducing points (M << N) with full Cholesky covariance. Good for N < 10,000.
-2. **LCGP (Locally Conditioned GP)**: Uses ALL points as inducing (M = N) with low-rank + diagonal covariance and locally conditioned KL. Excellent for N > 10,000.
+2. **LCGP (Locally Conditioned GP)**: Uses ALL points as inducing (M = N) with `S = Lu @ Lu.T` covariance (same as VNNGP) and locally conditioned KL. Excellent for N > 10,000.
 
 **Key idea**: Replace `GaussianPrior` (independent per-sample) with a spatial GP (`SVGP` or `LCGP`) while keeping the same `PoissonFactorization` likelihood and ELBO framework.
 
@@ -120,8 +120,6 @@ model = PNMF(
     multigroup=False,             # No groups needed
     # LCGP-specific parameters
     K=50,                        # 50 nearest neighbors for local conditioning
-    rank=55,                      # Low-rank component rank (default: K+5)
-    low_rank_mode='softplus',      # Constraint mode
     precompute_knn=True,           # Precompute KNN at init
     # Standard spatial parameters
     lengthscale=4.0,
@@ -158,8 +156,6 @@ model = PNMF(
     multigroup=True,              # Enable multi-group
     # LCGP-specific parameters
     K=50,
-    rank=55,
-    low_rank_mode='softplus',
     precompute_knn=True,
     # Standard spatial parameters
     lengthscale=4.0,
@@ -212,8 +208,6 @@ model_lcgp = PNMF(spatial=True, local=True, multigroup=False, K=50)
 | `diagonal_only` | `False` | Diagonal-only variational covariance (SVGP only) |
 | `inducing_allocation` | `'proportional'` | How to distribute inducing points across groups (SVGP only) |
 | `K` | `50` | Number of nearest neighbors for LCGP local conditioning (LCGP only) |
-| `rank` | `None` | Rank of low-rank component for LCGP. If None, defaults to `min(M, K + 5)` (LCGP only) |
-| `low_rank_mode` | `'softplus'` | Constraint mode for LCGP LowRankPlusDiagonal: `'softplus'` or `'exp'` (LCGP only) |
 | `precompute_knn` | `True` | Whether to precompute KNN indices at initialization for LCGP (LCGP only) |
 
 **Prior type derivation** (no `prior` parameter needed):
@@ -225,9 +219,9 @@ model_lcgp = PNMF(spatial=True, local=True, multigroup=False, K=50)
 
 | Aspect | GaussianPrior | SVGP (MGGP_SVGP) | LCGP (MGGP_LCGP) |
 |--------|--------------|-----------|-----------|
-| Parameters | mu (L,N), sigma (L,N) | mu (L,M), Lu (L,M,M), Z (M,2), kernel params | mu (L,M), Lu (L,M,R), Z (M,2), D (L,M), V (L,M,R), kernel params |
+| Parameters | mu (L,N), sigma (L,N) | mu (L,M), Lu (L,M,M), Z (M,2), kernel params | mu (L,M), Lu (L,M,K), Z (M,2), kernel params |
 | Inducing points | N/A | Subset via k-means (M << N) | **ALL points** (M = N) |
-| Covariance | Diagonal only | Full Cholesky (L, M, M) | Low-rank + diagonal: S = D + VV^T |
+| Covariance | Diagonal only | Full Cholesky (L, M, M) | S = Lu @ Lu.T (same as VNNGP) |
 | Forward input | None (or idx) | coordinates (N,2), groups (N,) | coordinates (N,2), groups (N,) |
 | Forward output | (qF, pF) | (qF, qU, pU) | (qF, qU, pU) |
 | KL divergence | Gaussian KL, scales with N/batch_size | Whitened KL on inducing points, no N-scaling | **Locally conditioned KL** via K nearest neighbors |
@@ -239,16 +233,18 @@ model_lcgp = PNMF(spatial=True, local=True, multigroup=False, K=50)
 
 **Key LCGP differences from SVGP:**
 - **Inducing points = all data**: LCGP uses all N points as inducing (no subset selection)
-- **Low-rank covariance**: Instead of full Cholesky (O(M²)), uses S = D + VV^T (O(MR))
+- **VNNGP-style covariance**: Lu is a raw `nn.Parameter(L, M, K)`, covariance S = Lu @ Lu.T (same as VNNGP)
 - **Locally conditioned KL**: KL computed using only K nearest neighbors per point (O(MK²) vs O(M³))
 - **Better scalability**: LCGP excels for large datasets (N > 10,000) with full spatial resolution
 
 **LCGP GPzoo overrides** (in `gpzoo/gp.py`, class `LCGP`):
 
-LCGP inherits SVGP → WSVGP but overrides three methods that WSVGP's defaults can't handle (because `Lu` is `LowRankPlusDiagonal`, not a simple tensor):
-- **`apply_constraints()`** — Returns `(mu, None)`. WSVGP's version calls `self.Lu.data` which fails on `LowRankPlusDiagonal`. Returning `None` for Lu defers to `reshape_parameters()`.
-- **`reshape_parameters()`** — Slices mu by KNN indices, calls `self.Lu.get_block(knn_idx)` to extract local K×K covariance blocks, then Cholesky-factors them. Follows the same pattern as VNNGP but uses `LowRankPlusDiagonal.get_block()` instead of raw Lu indexing.
-- **`forward()`** — Calls `super(SVGP, self).forward()` (WSVGP's forward) then squeezes the extra dimension, matching VNNGP's pattern.
+LCGP now uses the **same parameterization as VNNGP**: `Lu` is a raw `nn.Parameter(M, K)` and `S = Lu @ Lu.T`. The LCGP class inherits from SVGP and overrides the same methods as VNNGP:
+- **`apply_constraints()`** — Returns `(mu, Lu)` directly.
+- **`reshape_parameters()`** — Copied from VNNGP: indexes Lu by KNN indices, computes `S = Lu_knn @ Lu_knn.T`, then Cholesky-factors them.
+- **`forward()`** — Calls `super(SVGP, self).forward()` (WSVGP's forward) then squeezes the extra dimension.
+- **`forward_train()`** — Returns marginal `q(U_j) = N(mu_j, sum(Lu_j**2))` (same as VNNGP).
+- **`kl_divergence_full()`** — Copied from VNNGP: locally conditioned KL using the VNNGP's whitened formulation with `S_knnj`, `W2`, `WLu` terms.
 
 **KNN Convention:**
 - **Training** (`knn_idz`): `calculate_knn(Z)[:, 1:]` — excludes FIRST column (self-match, since Z=X for LCGP)
@@ -268,9 +264,10 @@ ELBO = E[log p(Y|F)] - KL(q(U) || p(U))
 
 **Initialization:**
 - **W**: Data-aware initialization shared by both spatial and non-spatial (`_initialize_W()`)
-- **Inducing points Z**: K-means selection via `mggp_kmeans_inducing_points()` (critical for GP quality)
+- **Inducing points Z**: K-means selection via `mggp_kmeans_inducing_points()` (SVGP only; LCGP uses Z = all coordinates)
 - **mu (inducing means)**: Random `N(0, 1)` scale (spatial uses `_create_spatial_prior()`, non-spatial uses `_initialize_mu_nonspatial()`)
-- **Lu (Cholesky)**: Random diagonal initialization via `CholeskyParameter`
+- **Lu (SVGP)**: Random diagonal initialization via `CholeskyParameter`
+- **Lu (LCGP)**: Random `nn.Parameter(L, M, K) * 1e-1` (same approach as VNNGP)
 
 
 ### 5. Key Features Implemented

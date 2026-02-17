@@ -646,8 +646,9 @@ class PNMF:
         try:
             from gpzoo.kernels import batched_MGGP_Matern32, batched_Matern32
             from gpzoo.gp import MGGP_SVGP, SVGP, LCGP, MGGP_LCGP
-            from gpzoo.modules import CholeskyParameter, LowRankPlusDiagonal
+            from gpzoo.modules import CholeskyParameter
             from gpzoo.model_utilities import mggp_kmeans_inducing_points, kmeans_inducing_points
+            from gpzoo.utilities import init_Lu as gpzoo_init_Lu, init_Lu_nsf  # noqa: F401
         except ImportError:
             raise ImportError(
                 "GPzoo is required for spatial mode. "
@@ -723,43 +724,34 @@ class PNMF:
             # === LCGP: Use ALL points as inducing points ===
             M = N  # LCGP uses all points as inducing points
             Z = coordinates.clone()  # All points are inducing points
+            K = self.K
             if self.multigroup and groups is not None:
                 groupsZ = groups.clone()
             else:
                 groupsZ = None
 
-            # Compute rank for low-rank component
-            rank = self.rank if self.rank is not None else min(M, self.K)
-
             # 3. Create GP
             if self.multigroup and groups is not None:
                 gp = MGGP_LCGP(
                     kernel, dim=coordinates.shape[1], M=M, n_groups=n_groups,
-                    jitter=self.jitter, K=self.K, rank=rank, diag_mode=self.low_rank_mode,
+                    jitter=self.jitter, K=K,
                 )
                 gp.Z = nn.Parameter(Z, requires_grad=False)
                 gp.groupsZ = nn.Parameter(groupsZ, requires_grad=False)
             else:
                 gp = LCGP(
                     kernel, dim=coordinates.shape[1], M=M,
-                    jitter=self.jitter, K=self.K, rank=rank, diag_mode=self.low_rank_mode,
+                    jitter=self.jitter, K=K,
                 )
                 gp.Z = nn.Parameter(Z, requires_grad=False)
 
-            # 4. Initialize LowRankPlusDiagonal for L latent factors
-            #    LCGP's Lu is LowRankPlusDiagonal with shape (L, M)
-            #    We need batch_size=L for multi-output GP
+            # 4. Initialize Lu as raw nn.Parameter (same approach as VNNGP)
+            #    Lu shape: (L, M, K) for L latent factors
             del gp.Lu
-            gp.Lu = LowRankPlusDiagonal(m=M, rank=rank, batch_size=L, diag_mode=self.low_rank_mode)
+            gp.Lu = nn.Parameter(torch.randn(L, M, K) * 1e-1)
 
-            # Initialize Lu similar to SVGP: small diagonal + small random off-diagonal
-            device = coordinates.device
-            gp.Lu.diag.data = torch.ones(L, 1, device=device)
-            gp.Lu.V.data = torch.randn(L, M, rank, device=device) * 1e-1
-
-            # Initialize mu to small random values
-            # Reference: GPzoo/gpzoo/models/nsf.py:669
-            gp.mu = nn.Parameter(torch.randn(L, M, device=device) * 0.1)
+            # Initialize mu: random N(0, 1)
+            gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
 
             # 5. Precompute KNN indices (always needed for training)
             knn_idx = gp.calculate_knn(coordinates)[:, :-1]  # Exclude self
@@ -1100,7 +1092,7 @@ class PNMF:
                 # For LCGP: Set per-batch KNN indices for forward_train()
                 # knn_idx = sliced for forward pass; knn_idz = FULL for kl_divergence_full
                 if self.local:
-                    knn_idx = self._knn_idx[idx] if idx is not None else self._knn_idx
+                    knn_idx = self._knn_idx[idx.cpu()] if idx is not None else self._knn_idx
                     self._prior.knn_idx = knn_idx
                     # knn_idz stays as full indices (set during _create_spatial_prior)
 
