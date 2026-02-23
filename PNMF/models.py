@@ -667,6 +667,8 @@ class PNMF:
                     seed=self.random_state or 123,
                     allocation=self.inducing_allocation,
                 )
+                # derived allocation may return fewer points than requested
+                M = Z.shape[0]
             else:
                 Z = kmeans_inducing_points(
                     coordinates, M,
