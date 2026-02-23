@@ -58,6 +58,11 @@ def _get_spatial_qF(model, coordinates=None, groups=None):
             grps = grps.to(device)
 
     with torch.no_grad():
+        # For LCGP: set KNN indices before calling forward()
+        if hasattr(model, 'local') and model.local:
+            knn_idx = model._prior.calculate_knn(coords)[:, :-1]
+            model._prior.knn_idx = knn_idx
+
         if grps is not None:
             qF, _, _ = model._prior(X=coords, groupsX=grps)
         else:

@@ -13,69 +13,30 @@ This document describes the development of the PNMF (Probabilistic Non-negative 
 ### 1. Package Structure
 
 ```
-Probabilistic-NMF/
-├── PNMF/                    # Python package module
-│   ├── __init__.py          # Package initialization and exports
-│   ├── models.py            # PoissonFactorization (PyTorch) + PNMF (sklearn API)
-│   ├── priors.py            # GaussianPrior class for variational inference
-│   ├── elbo.py              # Expected log-likelihood and ELBO computation
-│   ├── optimizers.py        # Custom optimizers (NaturalGradientDescent)
-│   ├── custom_modules.py    # Constrained parameter classes (ConstrainedParameter, PositiveParameter)
-│   └── transforms.py        # Transform and utility functions for factor extraction
-├── tests/                   # Test suite
-│   ├── __init__.py
-│   ├── test_pnmf.py         # Pytest tests for core components
-│   ├── test_transforms.py   # Pytest tests for transforms module
-│   ├── test_spatial.py      # Pytest tests for spatial SVGP mode
-│   └── test_spatial_training.py  # Training integration tests for spatial mode
-├── benchmarks/              # Benchmark scripts and notebooks
-│   ├── README.md            # Benchmark documentation
-│   ├── simple_vs_expanded.py    # Standalone benchmark script
-│   └── simple_vs_expanded.ipynb # Jupyter notebook with visualizations
-├── docs/                    # Sphinx documentation
-│   ├── conf.py              # Sphinx configuration with MathJax3 and nbsphinx
-│   ├── index.rst            # Landing page with mathematical formulation
-│   ├── api.rst              # Auto-generated API reference
-│   ├── examples.rst         # Usage examples
-│   ├── benchmarks.rst       # Benchmark page with embedded notebook
-│   └── requirements.txt     # Documentation dependencies
-├── setup.py                 # Minimal setup for backwards compatibility
-├── pyproject.toml           # Package metadata and all dependencies
-├── .readthedocs.yaml        # Read the Docs configuration
-├── README.md                # Documentation
-├── LICENSE                  # GPL v2.0 license
-└── .gitignore               # Git ignore patterns
+PNMF/
+├── models.py            # PoissonFactorization (PyTorch) + PNMF (sklearn API)
+├── priors.py            # GaussianPrior class for variational inference
+├── elbo.py              # Expected log-likelihood and ELBO computation
+├── optimizers.py        # NaturalGradientDescent optimizer
+├── custom_modules.py    # PositiveParameter, NaturalToMuS
+├── transforms.py        # Factor extraction utilities
+└── initialization.py    # W/F initialization methods
+
+tests/
+├── test_pnmf.py         # Core tests
+├── test_transforms.py   # Transforms tests
+├── test_spatial.py      # SVGP tests
+├── test_spatial_training.py  # Spatial training tests
+└── test_lcgp.py         # LCGP tests
 ```
 
 ### 2. Code Borrowed from GPzoo
 
-The following components were adapted from [GPzoo](https://github.com/luisdiaz1997/GPzoo):
-
-**From `gpzoo/modules.py`:**
-- `PositiveParameter` class - Handles constrained positive parameters with three modes:
-  - `softplus`: Uses softplus transformation for positivity
-  - `exp`: Uses exponential transformation for positivity
-  - `projected`: Uses projected gradient descent (clamps values >= 0 after each step) [DEFAULT]
-
-**From `gpzoo/gp.py`:**
-- `GaussianPrior` class - Variational distribution with mean/scale parameters
-- Returns (qF, pF) for ELBO computation
-- **NEW**: Now supports natural gradient parameterization (`use_natural_gradients=True`)
-- `MGGP_SVGP` / `SVGP` - Sparse Variational GP (used as spatial prior)
-
-**From `gpzoo/likelihoods.py`:**
-- `PoissonFactorization` base class - Variational Poisson factorization
-- Removed the `V` parameter (sample-specific scaling) for simplicity
-
-**From `gpzoo/kernels.py`:**
-- `batched_MGGP_Matern32` - Multi-group GP Matern 3/2 kernel (for spatial mode)
-- `batched_Matern32` - Standard batched Matern 3/2 kernel
-
-**From `gpzoo/modules.py`:**
-- `CholeskyParameter` - Constrained Cholesky factor parameterization (for SVGP variational covariance)
-
-**From `gpzoo/model_utilities.py`:**
-- `mggp_kmeans_inducing_points()` - K-means based inducing point selection for multi-group GPs
+Components adapted from [GPzoo](https://github.com/luisdiaz1997/GPzoo):
+- `PositiveParameter`, `CholeskyParameter` (modules.py)
+- `GaussianPrior`, `SVGP`, `LCGP`, `MGGP_SVGP`, `MGGP_LCGP` (gp.py)
+- `batched_Matern32`, `batched_MGGP_Matern32` (kernels.py)
+- `mggp_kmeans_inducing_points()`, `kmeans_inducing_points()` (model_utilities.py)
 
 ### 3. Architecture: Variational Inference
 
@@ -94,11 +55,18 @@ where:
 - For sklearn API: X (n_samples, n_features) ≈ exp(F) (n_samples, n_components) @ W.T (n_components, n_features)
 - Internal representation: X (D, N) ≈ W (D, L) @ exp(F) (L, N)
 
-### 4. Spatial Mode (SVGP Prior)
+### 4. Spatial Mode (SVGP and LCGP Priors)
 
-When `spatial=True`, the latent factors F are modeled by a **Sparse Variational Gaussian Process (SVGP)** over spatial coordinates instead of an independent Gaussian prior. Uses the **MGGP** (Multi-Group GP) variant with `batched_MGGP_Matern32` kernel from GPzoo for group-aware spatial smoothing.
+When `spatial=True`, the latent factors F are modeled by a spatial Gaussian Process over spatial coordinates instead of an independent Gaussian prior. PNMF supports two spatial GP approximations:
 
-**Key idea**: Replace `GaussianPrior` (independent per-sample) with `MGGP_SVGP` (spatially correlated, group-aware) while keeping the same `PoissonFactorization` likelihood and ELBO framework.
+1. **SVGP (Sparse Variational GP)**: Uses a subset of inducing points (M << N) with full Cholesky covariance. Good for N < 10,000.
+2. **LCGP (Locally Conditioned GP)**: Uses ALL points as inducing (M = N) with `S = Lu @ Lu.T` covariance (same as VNNGP) and locally conditioned KL. Excellent for N > 10,000.
+
+**Key idea**: Replace `GaussianPrior` (independent per-sample) with a spatial GP (`SVGP` or `LCGP`) while keeping the same `PoissonFactorization` likelihood and ELBO framework.
+
+Both modes support:
+- **Single-group**: Standard spatial smoothing without group structure (`multigroup=False`)
+- **Multi-group (MGGP)**: Group-aware spatial smoothing via `batched_MGGP_Matern32` kernel (`multigroup=True`)
 
 **Spatial API:**
 ```python
@@ -134,35 +102,157 @@ history, model = model.fit(
 transformed = model.transform(X_new, coordinates=coords_new, groups=groups_new)
 ```
 
+**LCGP API (single-group, no groups):**
+```python
+from PNMF import PNMF
+import numpy as np
+
+# Generate spatial data (no groups needed)
+N, D = 1000, 500
+X = np.random.poisson(5, size=(N, D)).astype(np.float32)
+coordinates = np.random.rand(N, 2).astype(np.float32) * 100
+
+# LCGP without groups — uses LCGP + batched_Matern32
+model = PNMF(
+    n_components=10,
+    spatial=True,
+    local=True,              # Use LCGP (locally conditioned GP)
+    multigroup=False,             # No groups needed
+    # LCGP-specific parameters
+    K=50,                        # 50 nearest neighbors for local conditioning
+    precompute_knn=True,           # Precompute KNN at init
+    # Standard spatial parameters
+    lengthscale=4.0,
+    sigma=1.0,
+    jitter=1e-5,
+    # Standard PNMF parameters
+    mode='expanded',
+    max_iter=500,
+    learning_rate=0.01,
+    y_batch_size=500,
+)
+
+# No groups argument needed
+history, model = model.fit(
+    X,
+    coordinates=coordinates,
+    return_history=True,
+)
+
+# Transform (no groups needed)
+transformed = model.transform(X, coordinates=coordinates)
+```
+
+**LCGP API (multi-group with groups):**
+```python
+# Generate spatial data with groups
+groups = np.random.randint(0, 4, size=N)
+
+# LCGP with groups — uses MGGP_LCGP + batched_MGGP_Matern32
+model = PNMF(
+    n_components=10,
+    spatial=True,
+    local=True,
+    multigroup=True,              # Enable multi-group
+    # LCGP-specific parameters
+    K=50,
+    precompute_knn=True,
+    # Standard spatial parameters
+    lengthscale=4.0,
+    sigma=1.0,
+    group_diff_param=10.0,         # Controls group similarity (MGGP-specific)
+    jitter=1e-5,
+    # Standard PNMF parameters
+    mode='expanded',
+    max_iter=500,
+    learning_rate=0.01,
+    y_batch_size=500,
+)
+
+# groups argument required when multigroup=True
+history, model = model.fit(
+    X,
+    coordinates=coordinates,
+    groups=groups,
+    return_history=True,
+)
+
+# Transform (groups required)
+transformed = model.transform(X, coordinates=coordinates, groups=groups)
+```
+
+**SVGP vs LCGP Comparison:**
+```python
+# SVGP: Fewer inducing points, full Cholesky covariance
+model_svgp = PNMF(spatial=True, local=False, multigroup=False, num_inducing=3000)
+
+# LCGP: All points as inducing, locally conditioned KL (better for large N)
+model_lcgp = PNMF(spatial=True, local=True, multigroup=False, K=50)
+```
+
 **Spatial Parameters:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `spatial` | `False` | Enable spatial GP prior |
-| `prior` | `'GaussianPrior'` | Auto-set to `'SVGP'` when `spatial=True` |
+| `local` | `False` | Use LCGP (all points as inducing) instead of SVGP. Only used when `spatial=True` |
 | `kernel` | `'Matern32'` | Kernel function |
-| `multigroup` | `True` | Use MGGP (multi-group GP) |
-| `num_inducing` | `3000` | Number of inducing points M |
+| `multigroup` | `False` | Use MGGP (multi-group GP) |
+| `num_inducing` | `3000` | Number of inducing points M (SVGP only, ignored for LCGP) |
 | `lengthscale` | `1.0` | Kernel lengthscale |
 | `sigma` | `1.0` | Kernel output scale |
-| `group_diff_param` | `10.0` | Group difference scaling |
+| `group_diff_param` | `10.0` | Group difference scaling (MGGP only) |
 | `jitter` | `1e-5` | Numerical stability |
 | `train_lengthscale` | `False` | Whether to train kernel lengthscale |
-| `cholesky_mode` | `'exp'` | Cholesky diagonal constraint |
-| `diagonal_only` | `False` | Diagonal-only variational covariance |
-| `inducing_allocation` | `'proportional'` | How to distribute inducing points across groups |
+| `cholesky_mode` | `'exp'` | Cholesky diagonal constraint (SVGP only) |
+| `diagonal_only` | `False` | Diagonal-only variational covariance (SVGP only) |
+| `inducing_allocation` | `'proportional'` | How to distribute inducing points across groups (SVGP only) |
+| `K` | `50` | Number of nearest neighbors for LCGP local conditioning (LCGP only) |
+| `precompute_knn` | `True` | Whether to precompute KNN indices at initialization for LCGP (LCGP only) |
 
-**Architecture differences (spatial vs non-spatial):**
+**Prior type derivation** (no `prior` parameter needed):
+- `spatial=False` → `GaussianPrior`
+- `spatial=True, local=False` → `SVGP`
+- `spatial=True, local=True` → `LCGP`
 
-| Aspect | GaussianPrior | MGGP_SVGP |
-|--------|--------------|-----------|
-| Parameters | mu (L,N), sigma (L,N) | mu (L,M), Lu (L,M,M), Z (M,2), kernel params |
-| Forward input | None (or idx) | coordinates (N,2), groups (N,) |
-| Forward output | (qF, pF) | (qF, qU, pU) |
-| KL divergence | Gaussian KL, scales with N/batch_size | Whitened KL on inducing points, no N-scaling |
-| Mini-batch | Index into mu/sigma columns | Pass coordinate subset to GP forward |
-| transform() | NNLS multiplicative updates | GP predictive at new coordinates |
-| Dependency | PyTorch only | PyTorch + GPzoo (lazy import) |
+**Architecture differences (GaussianPrior vs SVGP vs LCGP):**
+
+| Aspect | GaussianPrior | SVGP (MGGP_SVGP) | LCGP (MGGP_LCGP) |
+|--------|--------------|-----------|-----------|
+| Parameters | mu (L,N), sigma (L,N) | mu (L,M), Lu (L,M,M), Z (M,2), kernel params | mu (L,M), Lu (L,M,K), Z (M,2), kernel params |
+| Inducing points | N/A | Subset via k-means (M << N) | **ALL points** (M = N) |
+| Covariance | Diagonal only | Full Cholesky (L, M, M) | S = Lu @ Lu.T (same as VNNGP) |
+| Forward input | None (or idx) | coordinates (N,2), groups (N,) | coordinates (N,2), groups (N,) |
+| Forward output | (qF, pF) | (qF, qU, pU) | (qF, qU, pU) |
+| KL divergence | Gaussian KL, scales with N/batch_size | Whitened KL on inducing points, no N-scaling | **Locally conditioned KL** via K nearest neighbors |
+| Mini-batch | Index into mu/sigma columns | Pass coordinate subset to GP forward | Pass coordinate subset + update KNN indices |
+| transform() | NNLS multiplicative updates | GP predictive at new coordinates | GP predictive at new coordinates (same as SVGP) |
+| Dependency | PyTorch only | PyTorch + GPzoo (lazy import) | PyTorch + GPzoo (lazy import) |
+| Scalability | Good for small N | Good for N < 10,000 | **Excellent for N > 10,000** |
+| Spatial resolution | Independent per sample | Limited by M inducing points | **Full resolution** (every point) |
+
+**Key LCGP differences from SVGP:**
+- **Inducing points = all data**: LCGP uses all N points as inducing (no subset selection)
+- **VNNGP-style covariance**: Lu is a raw `nn.Parameter(L, M, K)`, covariance S = Lu @ Lu.T (same as VNNGP)
+- **Locally conditioned KL**: KL computed using only K nearest neighbors per point (O(MK²) vs O(M³))
+- **Better scalability**: LCGP excels for large datasets (N > 10,000) with full spatial resolution
+
+**LCGP GPzoo overrides** (in `gpzoo/gp.py`, class `LCGP`):
+
+LCGP now uses the **same parameterization as VNNGP**: `Lu` is a raw `nn.Parameter(M, K)` and `S = Lu @ Lu.T`. The LCGP class inherits from SVGP and overrides the same methods as VNNGP:
+- **`apply_constraints()`** — Returns `(mu, Lu)` directly.
+- **`reshape_parameters()`** — Copied from VNNGP: indexes Lu by KNN indices, computes `S = Lu_knn @ Lu_knn.T`, then Cholesky-factors them.
+- **`forward()`** — Calls `super(SVGP, self).forward()` (WSVGP's forward) then squeezes the extra dimension.
+- **`forward_train()`** — Returns marginal `q(U_j) = N(mu_j, sum(Lu_j**2))` (same as VNNGP).
+- **`kl_divergence_full()`** — Copied from VNNGP: locally conditioned KL using the VNNGP's whitened formulation with `S_knnj`, `W2`, `WLu` terms.
+
+**KNN Convention:**
+- **Training** (`knn_idz`): `calculate_knn(Z)[:, 1:]` — excludes FIRST column (self-match, since Z=X for LCGP)
+- **Inference** (`knn_idx`): `calculate_knn(X)[:, :-1]` — excludes LAST column (keeps nearest K, since X→Z lookup may include self as nearest)
+- Both yield exactly K neighbors. Training uses `knn_idz` for KL; inference uses `knn_idx` for forward.
+- KNN is set in two inference paths:
+  - `PNMF.transform()` in `models.py` — before calling `self._prior()`
+  - `_get_spatial_qF()` in `transforms.py` — before calling `model._prior()` (used by `log_factors`, `get_factors`, `factor_uncertainty`, `factor_samples`)
 
 **ELBO for spatial mode:**
 ```
@@ -174,9 +264,10 @@ ELBO = E[log p(Y|F)] - KL(q(U) || p(U))
 
 **Initialization:**
 - **W**: Data-aware initialization shared by both spatial and non-spatial (`_initialize_W()`)
-- **Inducing points Z**: K-means selection via `mggp_kmeans_inducing_points()` (critical for GP quality)
+- **Inducing points Z**: K-means selection via `mggp_kmeans_inducing_points()` (SVGP only; LCGP uses Z = all coordinates)
 - **mu (inducing means)**: Random `N(0, 1)` scale (spatial uses `_create_spatial_prior()`, non-spatial uses `_initialize_mu_nonspatial()`)
-- **Lu (Cholesky)**: Random diagonal initialization via `CholeskyParameter`
+- **Lu (SVGP)**: Random diagonal initialization via `CholeskyParameter`
+- **Lu (LCGP)**: Random `nn.Parameter(L, M, K) * 1e-1` (same approach as VNNGP)
 
 
 ### 5. Key Features Implemented
@@ -210,14 +301,16 @@ rate, qF, pF = model(E=3)  # Returns rate tensor and distributions
 
 **Default Parameters:**
 - `n_components`: 10
-- `loadings_mode`: `'projected'` (clamp after each step)
+- `loadings_mode`: `'projected'` (clamp after each step). Also: `'softplus'`, `'exp'`, `'multiplicative'`
 - `mode`: `'expanded'` (hybrid Monte Carlo + analytic ELBO)
 - `training_mode`: `'standard'` (standard gradient descent)
-- `E`: 3 (Monte Carlo samples for ELBO)
+- `E`: 3 (Monte Carlo samples for ELBO, auto-set to 1 for lower-bound mode)
 - `max_iter`: 200
 - `tol`: 1e-4
 - `learning_rate`: 0.01
 - `optimizer`: `'Adam'` (Adam, AdamW, NAdam, SGD, RMSprop)
+- `scheduler`: `'one_cycle'` (OneCycleLR with warmup)
+- `init`: `'random'` (also: `'nndsvd'`, `'nndsvda'`, `'nndsvdar'`, `'k-means'`)
 
 ### 6. Installation
 
@@ -358,15 +451,16 @@ See the **ELBO Computation Modes** section above for details on how the expected
 
 **PNMF** (`models.py`)
 - sklearn-compatible wrapper
-- Creates GaussianPrior (non-spatial) or MGGP_SVGP (spatial) internally
+- Creates GaussianPrior (non-spatial), SVGP/MGGP_SVGP (spatial), or LCGP/MGGP_LCGP (spatial+local) internally
 - Uses ELBO loss instead of NLL
 - `training_mode` parameter: `'standard'` or `'natural'` (natural not supported with spatial)
 - `spatial` parameter enables GP prior mode
 - Key internal methods:
-  - `_create_spatial_prior()` — builds MGGP_SVGP with kernel, inducing points, batched mu/Lu
+  - `_create_spatial_prior()` — builds SVGP/MGGP_SVGP or LCGP/MGGP_LCGP with kernel, inducing points, batched mu/Lu
   - `_initialize_W()` — shared W initialization for both spatial and non-spatial
   - `_initialize_mu_nonspatial()` — variational mean init for non-spatial models
   - `_create_optimizer()` — optimizer factory (replaces duplicated code)
+- LCGP inference paths (`transform()`, `_get_spatial_qF()`) set KNN indices before calling `forward()` (see KNN Convention below)
 
 ### PositiveParameter Class
 
@@ -375,26 +469,6 @@ A sophisticated parameter class that:
 - Applies transformations (`softplus`, `exp`, or `projected`) to enforce positivity
 - Provides a tensor-like interface for easy manipulation
 - Supports projection via `project()` method for constrained optimization
-
-## Usage Example
-
-```python
-from PNMF import PNMF
-import numpy as np
-
-# Create sample data (positive floats)
-X = np.random.rand(100, 50)
-
-# Initialize and fit
-model = PNMF(n_components=5, random_state=42, verbose=True)
-transformed = model.fit_transform(X)
-
-# Access results
-print(f"Components shape: {model.components_.shape}")  # (5, 50)
-print(f"Transformed shape: {transformed.shape}")                 # (100, 5)
-print(f"ELBO: {model.elbo_}")
-print(f"Iterations: {model.n_iter_}")
-```
 
 ## Testing
 
@@ -427,458 +501,40 @@ The test suite covers:
 - **TestSpatialTransform**: Spatial transform and fit_transform
 - **TestSpatialFactorExtraction**: Factor extraction functions with spatial models
 - **TestSpatialTraining**: Training integration tests for spatial mode (convergence, ELBO modes)
+- **TestLCGPValidation**: LCGP parameter validation (K, etc.)
+- **TestLCGPFit**: LCGP fitting (no-groups, multigroup, ELBO modes, etc.)
+- **TestLCGPBatching**: LCGP with sample/feature/both mini-batching
+- **TestLCGPTransform**: LCGP transform, fit_transform, new coordinates
+- **TestLCGPFactorExtraction**: Factor extraction with LCGP (log_factors, get_factors, uncertainty, samples, loadings)
+- **TestLCGPNoGroups**: LCGP without groups (fit, transform, factor extraction, all-points-as-inducing verification)
 
-Spatial tests require `gpzoo` and are auto-skipped if not installed (`@pytest.mark.skipif`).
-
-### Quick Verification
-
-Quick test to verify the implementation works:
-
-```python
-from PNMF import PNMF
-import numpy as np
-
-# Create integer count data (appropriate for Poisson model)
-np.random.seed(42)
-X = np.random.poisson(lam=5, size=(50, 30)).astype(np.float32)
-
-# Initialize and fit
-model = PNMF(n_components=5, random_state=42, verbose=True, max_iter=20)
-transformed = model.fit_transform(X)
-
-print(f'Components shape: {model.components_.shape}')  # (5, 30)
-print(f'Transformed shape: {transformed.shape}')       # (50, 5)
-print(f'ELBO: {model.elbo_:.4f}')
-print(f'Iterations: {model.n_iter_}')
-```
+Spatial and LCGP tests require `gpzoo` and are auto-skipped if not installed (`@pytest.mark.skipif`).
 
 ## Documentation
 
-The project uses **Sphinx** with the **Read the Docs** theme for documentation.
-
-### Building Documentation Locally
-
+The project uses **Sphinx** with **Read the Docs** theme. Build locally with:
 ```bash
-# Install documentation dependencies
 pip install -r docs/requirements.txt
-
-# Build HTML documentation
 sphinx-build -b html docs/ docs/_build/html
-
-# View in browser
-open docs/_build/html/index.html  # macOS
-# or
-xdg-open docs/_build/html/index.html  # Linux
 ```
 
-### Documentation Features
-
-- **MathJax3**: Full LaTeX support for mathematical equations
-  - Custom macros: `\E` for expectation, `\KL` for KL divergence, `\calL` for loss
-- **Autodoc**: Automatic API documentation from docstrings
-- **Intersphinx**: Links to Python, PyTorch, NumPy, and scikit-learn docs
-- **Napoleon**: Support for Google and NumPy style docstrings
-- **nbsphinx**: Support for rendering Jupyter notebooks in the documentation
-
-### Benchmark Page
-
-The documentation includes a **Benchmark** page that compares all three ELBO computation modes:
-
-- **Notebook**: `benchmarks/simple_vs_expanded.ipynb` embedded directly in the docs
-- **Comparison**: Convergence speed, final ELBO, and reconstruction error for all three modes
-- **Visualizations**: Log-log scale ELBO convergence plots and distance-to-convergence curves
-- **Mathematical background**: Jensen's inequality sandwich bounds derivation
-- **Benchmark results** (8000 iterations, E=10, lr=0.005, Adam):
-  - **Convergence**: Lower Bound (6947) > Expanded (7022) > Simple (7592)
-  - **Final ELBO**: Expanded (-47198.61) > Simple (-47322.61) > Lower Bound (-47543.07)
-  - **Reconstruction error**: Expanded (0.241310) > Lower Bound (0.241432) > Simple (0.241737)
-  - **Winner**: Lower Bound (fastest), Expanded (best ELBO)
-- **Recommended usage**:
-  - `mode='lower-bound'`: Large datasets, neural network/GP posteriors
-  - `mode='expanded'`: Best final ELBO, standard applications (default)
-  - `mode='simple'`: Debugging, baseline comparisons
-- **Device**: MPS (Apple Silicon) with automatic detection (CUDA > MPS > CPU)
-
-To run the benchmark locally:
+**Benchmark notebook**: `benchmarks/simple_vs_expanded.ipynb` compares all three ELBO modes. Run with:
 ```bash
-# Standalone script
-python benchmarks/simple_vs_expanded.py
-
-# Jupyter notebook
-jupyter notebook benchmarks/simple_vs_expanded.ipynb
+python benchmarks/simple_vs_expanded.py  # standalone
+jupyter notebook benchmarks/simple_vs_expanded.ipynb  # interactive
 ```
 
-### Read the Docs
-
-The `.readthedocs.yaml` file configures automatic builds on Read the Docs:
-
-1. Connect the GitHub repository to Read the Docs
-2. Builds are triggered automatically on commits
-3. Documentation is deployed to `https://pnmf.readthedocs.io/`
+**Recommended ELBO modes:**
+- `mode='expanded'`: Best final ELBO, standard applications (default)
+- `mode='lower-bound'`: Large datasets, neural network/GP posteriors (fastest)
+- `mode='simple'`: Debugging, baseline comparisons
 
 ## Future Work
 
 Potential improvements:
 - Fix SGD optimizer divergence (add gradient clipping or per-parameter learning rates)
-- Add more initialization methods (e.g., 'nndsvd', 'k-means')
 - Add support for sparse matrices
 - Add benchmarking against sklearn NMF
-- GP regression-based μ initialization for spatial mode (Option 3 from SVGP_INITIALIZATION.md — needed for NNDSVD/k-means init in spatial)
-- Initialize Lu from Kzz structure for spatial mode
+- GP regression-based μ initialization for spatial mode
 - Support additional GP kernels beyond Matern32
 - Train kernel hyperparameters (currently sigma and group_diff_param are frozen)
-
-## Recent Changes
-
-### 2025-02: Add SVGP Spatial Prior Support (Branch: SVGP)
-
-**What was changed:**
-- Added `spatial=True` mode to PNMF using SVGP (Sparse Variational GP) from GPzoo as an alternative prior
-- Added spatial parameters to PNMF constructor: `spatial`, `prior`, `kernel`, `multigroup`, `num_inducing`, `lengthscale`, `sigma`, `group_diff_param`, `jitter`, `train_lengthscale`, `cholesky_mode`, `diagonal_only`, `inducing_allocation`
-- Added `coordinates` and `groups` arguments to `fit()`, `transform()`, `fit_transform()`
-- Added `_create_spatial_prior()` method that builds MGGP_SVGP with kernel, k-means inducing points, and batched variational parameters
-- Adapted `PoissonFactorization.forward()` to handle both GaussianPrior and GP prior (returns different tuples)
-- Adapted training loop: spatial uses whitened KL on inducing points (no N-scaling), non-spatial uses Gaussian KL
-- Adapted mini-batching: spatial passes coordinate subsets to GP, non-spatial indexes into mu/sigma
-- Updated `PNMF/transforms.py`: all factor extraction functions (`log_factors`, `get_factors`, `factor_uncertainty`, `factor_samples`) now support spatial models via `_get_spatial_qF()` helper
-- Added `spatial` optional dependency in `pyproject.toml` (gpzoo + faiss-cpu)
-- Refactored `_initialize_parameters()` into `_initialize_W()` (shared) + `_initialize_mu_nonspatial()` (non-spatial only)
-- Improved spatial initialization: mu scale from `0.01` to `1.0`, random diagonal Lu init
-- Extracted `_create_optimizer()` helper to eliminate duplicated optimizer creation code
-- Added validation rules for spatial parameters in `_validate_params()`
-- Created `tests/test_spatial.py` (validation, fitting, transform, factor extraction)
-- Created `tests/test_spatial_training.py` (training convergence, ELBO modes)
-
-**Files modified:**
-- `PNMF/models.py` — PNMF `__init__`, `fit()`, `transform()`, `fit_transform()`, `_validate_params()`, `PoissonFactorization.forward()`, new methods `_create_spatial_prior()`, `_initialize_W()`, `_initialize_mu_nonspatial()`, `_create_optimizer()`
-- `PNMF/transforms.py` — Added `_get_spatial_qF()`, updated `log_factors()`, `get_factors()`, `factor_uncertainty()`, `factor_samples()` with `coordinates`/`groups` params
-- `pyproject.toml` — Added `[project.optional-dependencies] spatial`
-
-**Files NOT changed:**
-- `PNMF/elbo.py` — Works with any Normal qF, no changes needed
-- `PNMF/priors.py` — GaussianPrior unchanged
-- `PNMF/custom_modules.py` — No changes needed
-- `PNMF/optimizers.py` — NGD not used with spatial
-
-### 2025-01-27: Add General Transforms and Utility Functions
-
-**What was changed:**
-- Created new `PNMF/transforms.py` module with transform and utility functions
-- Added factor extraction functions: `log_factors()`, `factors()`, `factor_uncertainty()`, `factor_samples()`
-- Added model accessor functions: `get_loadings()`, `get_prior()`
-- Added conditional inference functions: `transform_F()`, `transform_W()`
-- Added prior utility functions: `log_factors_from_prior()`, `factors_from_prior()`, `uncertainty_from_prior()`
-- Updated `__init__.py` to export all new functions
-- Created comprehensive test suite in `tests/test_transforms.py` (40 tests)
-- Updated `docs/api.rst` with new function documentation
-- Updated `docs/examples.rst` with usage examples
-
-**Why it matters:**
-- **Factor extraction**: Easy access to latent factors in log-space (`log_factors`), exp-space (`factors`), with uncertainty (`factor_uncertainty`), or as samples (`factor_samples`)
-- **Bayesian transform**: `transform_F` learns a full variational distribution for new data (better than NNLS-based `transform`)
-- **Flexible conditioning**: Can condition on either F (`transform_W`) or W (`transform_F`) to learn the other
-- **Uncertainty quantification**: Sample from q(F) and propagate uncertainty through downstream analysis
-
-**Module structure:**
-```python
-# PNMF/transforms.py
-
-# Factor extraction
-def log_factors(model, return_tensor=False) -> ndarray  # μ from q(F)
-def factors(model, use_mgf=True, return_tensor=False) -> ndarray  # E[exp(F)]
-def factor_uncertainty(model, return_variance=False, return_tensor=False) -> ndarray  # σ or σ²
-def factor_samples(model, n_samples=100, return_exp=False, return_tensor=False) -> ndarray
-
-# Model accessors
-def get_loadings(model, return_tensor=False) -> ndarray  # W matrix
-def get_prior(model) -> GaussianPrior  # Full prior object
-
-# Conditional inference
-def transform_F(X, W, ..., return_prior=False) -> ndarray or GaussianPrior
-def transform_W(X, F, ...) -> ndarray
-
-# Prior utilities
-def log_factors_from_prior(prior, return_tensor=False) -> ndarray
-def factors_from_prior(prior, use_mgf=True, return_tensor=False) -> ndarray
-def uncertainty_from_prior(prior, return_variance=False, return_tensor=False) -> ndarray
-```
-
-**Usage example:**
-```python
-from PNMF import PNMF, log_factors, factors, factor_uncertainty, get_loadings, transform_F
-import numpy as np
-
-# Fit model
-X_train = np.random.poisson(5, size=(100, 50)).astype(np.float32)
-model = PNMF(n_components=5).fit(X_train)
-
-# Extract factors
-F_log = log_factors(model)        # (100, 5) - μ from q(F)
-F_exp = factors(model)            # (100, 5) - E[exp(F)] = exp(μ + σ²/2)
-F_std = factor_uncertainty(model) # (100, 5) - σ from q(F)
-
-# Transform new data with full VI
-X_test = np.random.poisson(5, size=(20, 50)).astype(np.float32)
-W = get_loadings(model)
-F_test = transform_F(X_test, W, max_iter=100)  # (20, 5)
-```
-
-### 2025-01-14: Separate expected log-likelihood from KL divergence in elbo.py
-
-**What was changed:**
-- Refactored `PNMF/elbo.py` to separate expected log-likelihood (modes) from KL divergence
-- Renamed ELBO functions to expected log-likelihood functions:
-  - `compute_elbo_simple()` → `expected_log_likelihood_simple()`
-  - `compute_elbo_expanded()` → `expected_log_likelihood_expanded()`
-  - `compute_elbo_lower_bound()` → `expected_log_likelihood_lower_bound()`
-- Added new dispatcher `expected_log_likelihood()` for expected log-likelihood only
-- Added `kl_divergence()` as a separate function
-- Updated `compute_elbo()` to accept optional `kl_fn` parameter for custom KL implementations
-- Exported new functions in `__init__.py`
-
-**Why it matters:**
-- **Custom KL divergence**: Can now pass a custom KL function to `compute_elbo()`
-- **Better modularity**: Expected log-likelihood and KL divergence are now independent
-- **Future extensibility**: Easier to add custom KL implementations (e.g., for different priors)
-- **Cleaner API**: Users can access individual components if needed
-
-**Module structure:**
-```python
-# PNMF/elbo.py
-
-# Helper
-def poisson_log_likelihood(X, rate) -> Tensor
-
-# Expected log-likelihood functions (modes)
-def expected_log_likelihood_simple(rate, X) -> Tensor
-def expected_log_likelihood_expanded(rate, qF, X, W) -> Tensor
-def expected_log_likelihood_lower_bound(qF, X, W) -> Tensor
-def expected_log_likelihood(mode, rate, qF, X, W) -> Tensor  # dispatcher
-
-# KL divergence
-def kl_divergence(qF, pF) -> Tensor
-
-# Full ELBO (combines expected log-likelihood - KL)
-def compute_elbo(mode, rate, qF, pF, X, W, kl_fn=None) -> Tensor
-```
-
-**Usage with custom KL:**
-```python
-from PNMF import compute_elbo
-
-# Custom KL function
-def my_custom_kl(qF, pF):
-    # Custom implementation
-    return ...
-
-# Use custom KL in ELBO computation
-loss = compute_elbo(mode, rate, qF, pF, X, W, kl_fn=my_custom_kl)
-```
-
-### 2025-01-14: Refactor ELBO computation into separate module
-
-**What was changed:**
-- Created new `PNMF/elbo.py` module with all ELBO computation functions
-- Extracted from `models.py`:
-  - `poisson_log_likelihood()` - helper function
-  - `compute_elbo_simple()` - full Monte Carlo ELBO
-  - `compute_elbo_expanded()` - hybrid MC + analytic ELBO
-  - `compute_elbo_lower_bound()` - fully analytic Jensen's bound ELBO
-  - `compute_elbo()` - dispatcher function
-- Updated `models.py` to import and use the new `elbo.py` module
-- Removed ~180 lines of ELBO methods from `PNMF` class
-
-**Why it matters:**
-- **Better separation of concerns**: ELBO computation is now isolated from model architecture
-- **Cleaner codebase**: `models.py` focuses on model structure, `elbo.py` on loss computation
-- **Easier testing**: ELBO functions can be tested independently
-- **Reusability**: ELBO functions can be used outside the PNMF class if needed
-
-### 2025-01-03: Add Natural Gradient Training Mode (Commit `XXXXXXX`)
-
-**What was changed:**
-- Added `NaturalToMuS` autograd function to `custom_modules.py` for natural parameter conversion
-- Added `NaturalGradientDescent` optimizer class to `models.py` implementing NGD for variational parameters
-- Modified `GaussianPrior` class to support natural parameterization (`use_natural_gradients` parameter)
-- Added `training_mode` parameter to `PNMF` class (`'standard'` or `'natural'`)
-- Updated `fit()` method to use dual optimizers in natural mode:
-  - NGD for variational parameters (θ₁, θ₂)
-  - Adam/other for W parameters
-
-**Why it matters:**
-- **Better convergence**: Natural gradient mode achieves ~20% better ELBO than standard mode
-- **Faster optimization**: NGD uses the Fisher information matrix for more efficient parameter updates
-- **Theoretically sound**: Natural gradients follow the geometry of the variational distribution
-
-**Usage:**
-```python
-# Standard training mode (default)
-model_std = PNMF(n_components=5, training_mode='standard')
-
-# Natural gradient training mode
-model_nat = PNMF(n_components=5, training_mode='natural')
-```
-
-**Technical details:**
-- **Natural parameterization**: Gaussian variational distribution parameterized by (θ₁, θ₂) instead of (μ, s):
-  - θ₁ = μ/s² (natural parameter for mean)
-  - θ₂ = -1/(2s²) (natural parameter for precision)
-- **Natural gradient computation**: The `NaturalToMuS` autograd function computes gradients w.r.t. expectation parameters (η₁, η₂):
-  - η₁ = μ
-  - η₂ = s² + μ²
-- **NGD optimizer**: Learning rate `lr=0.1` scaled by `1/num_data` as per natural gradient theory
-
-**Benchmark results** (50 iterations, 5 components, 50 samples):
-- **Standard + expanded**: ELBO = -5266.88
-- **Standard + lower-bound**: ELBO = -6528.74
-- **Natural + expanded**: ELBO = -4186.40 (**+21% improvement**)
-- **Natural + lower-bound**: ELBO = -4989.78 (**+24% improvement**)
-
-**Recommended usage:**
-- **`training_mode='natural'`**: Better ELBO, faster convergence, recommended for most applications
-- **`training_mode='standard'`**: Baseline comparison, simpler implementation
-
-### 2025-01-03: Add Lower-Bound ELBO Mode with Jensen's Inequality (Commit `c802385`)
-
-**What was changed:**
-- Added `mode='lower-bound'`: Fully analytic ELBO using Jensen's lower bound
-- Updated `mode='simple'` to use `torch.distributions.Poisson.log_prob()` directly
-- Added `_elbo_lower_bound()` method with zero Monte Carlo sampling
-- Updated benchmark to compare all three modes (simple, expanded, lower-bound)
-- Added mathematical background with Jensen's inequality sandwich bounds to documentation
-- Updated `docs/benchmarks.rst` with new results and recommended usage guide
-
-**Why it matters:**
-- **Fastest mode**: Lower-bound mode is ~1.09x faster than simple mode, ~1.01x faster than expanded mode
-- **Zero variance**: No Monte Carlo sampling means fully deterministic gradients
-- **Best for large-scale**: When q(F) comes from neural networks or GPs, this avoids expensive sampling
-- **True lower bound**: Mathematically guaranteed lower bound on ELBO via Jensen's inequality
-
-**Usage:**
-```python
-# Lower-bound mode (fastest, fully analytic)
-model_lb = PNMF(n_components=5, mode='lower-bound')
-
-# Expanded mode (best ELBO, default)
-model_exp = PNMF(n_components=5, mode='expanded')
-
-# Simple mode (full Monte Carlo)
-model_simple = PNMF(n_components=5, mode='simple')
-```
-
-**Technical details:**
-- Jensen's inequality provides sandwich bounds for the log-sum-exp term:
-  ```
-  log Σ W * exp(μ) ≤ E[log Σ W * exp(F)] ≤ log Σ W * exp(μ + σ²/2)
-  ```
-- Lower bound uses left inequality: `E[log Σ W * exp(F)] ≥ log Σ W * exp(E[F]) = log Σ W * exp(μ)`
-- No MC sampling required - all computations are analytic
-
-**Benchmark results** (8000 iterations, E=10, lr=0.005, Adam):
-- **Convergence**: Lower Bound (6947 iter) > Expanded (7022) > Simple (7592)
-- **Final ELBO**: Expanded (-47198.61, highest) > Simple (-47322.61) > Lower Bound (-47543.07)
-- **Reconstruction error**: Expanded (0.241310, lowest) > Lower Bound (0.241432) > Simple (0.241737)
-
-**Recommended usage:**
-- **`mode='lower-bound'`**: Large datasets, neural network/GP posteriors, fast prototyping
-- **`mode='expanded'`**: Best final ELBO, standard applications (default)
-- **`mode='simple'`**: Debugging, baseline comparisons
-
-### 2025-01-03: Add Optimizer Parameter and Improve Benchmark (Commit `7f587cc`)
-
-**What was changed:**
-- Added `optimizer` parameter to `PNMF` class (Adam, AdamW, NAdam, SGD, RMSprop)
-- Added `return_history` parameter to `fit()` method (Keras-style API)
-- Simplified benchmark code to use model's `fit()` method directly
-- Updated benchmark to use 2000 iterations with Adam optimizer
-- Generate integer count data via Poisson sampling (appropriate for Poisson model)
-- Plot loss (-ELBO) on log scale instead of ELBO
-- Added gradient clipping stability fix for scale parameter (clamp to >= 1e-8)
-- Updated documentation with new benchmark results
-
-**Why it matters:**
-- Users can now choose between different optimizers (Adam works best, SGD diverges)
-- Cleaner API: `history, model = model.fit(X, return_history=True)` like Keras
-- Integer count data is more appropriate for the Poisson likelihood
-- Loss on log scale better shows optimization trajectory
-
-**Usage:**
-```python
-# With history tracking (Keras-style)
-history, model = model.fit(X, return_history=True)
-
-# Different optimizers
-model_adam = PNMF(n_components=5, optimizer='Adam')      # Works well
-model_nadam = PNMF(n_components=5, optimizer='NAdam')    # Works well
-model_sgd = PNMF(n_components=5, optimizer='SGD')        # Diverges (needs fix)
-```
-
-**Technical details:**
-- SGD diverges due to unstable gradients - needs gradient clipping or adaptive learning rate
-- Scale parameter clamped to >= 1e-8 to prevent Normal distribution validation errors
-- Benchmark now uses `exp(qF.mean) @ W.T` for proper reconstruction
-
-**Known Issues:**
-- **SGD optimizer** diverges - needs gradient clipping or per-parameter learning rates
-
-### 2025-01-03: Add ELBO Mode Parameter and Benchmarks (Commit `1950650`)
-
-**What was changed:**
-- Added `mode` parameter to `PNMF` and `PoissonFactorization` classes
-- Implemented `mode='simple'`: Full Monte Carlo ELBO estimation
-- Implemented `mode='expanded'` (default): Hybrid Monte Carlo + analytic expectation
-- Added `_elbo_simple()` and `_elbo_expanded()` methods with dispatcher `_elbo()`
-- Created `benchmarks/` folder with comparison notebook and standalone script
-- Added `nbsphinx` support to render Jupyter notebooks in documentation
-- Added `docs/benchmarks.rst` page with embedded benchmark notebook
-
-**Why it matters:**
-- Users can now choose between two ELBO computation strategies
-- `expanded` mode (default) has lower variance and typically converges faster
-- `simple` mode is more straightforward and easier to understand
-- Benchmark page allows direct comparison of convergence speed and final ELBO
-
-**Usage:**
-```python
-# Simple mode (full Monte Carlo)
-model = PNMF(n_components=5, mode='simple')
-
-# Expanded mode (hybrid, default)
-model = PNMF(n_components=5, mode='expanded')
-```
-
-**Technical details:**
-- `mode='simple'`: All terms estimated via Monte Carlo
-  - `log_lik = (X * log(rate) - rate - lgamma(X + 1)).mean()`
-- `mode='expanded'`: Second term computed analytically
-  - `E[exp(F)] = exp(μ + σ²/2)` (Gaussian moment-generating function)
-  - Reduces variance in gradient estimates
-
-### 2025-01-03: Add Poisson Normalization Constant (Commit `a7c872b`)
-
-**What was changed:**
-- Added `-torch.lgamma(X + 1).sum()` to the ELBO calculation in `PNMF/models.py`
-- This implements the `-log(Y!)` term from the complete Poisson log-PMF
-- Added `tqdm` progress bar for better user experience during training
-
-**Why it matters:**
-- The ELBO now includes the full Poisson normalization constant
-- ELBO values are directly comparable to `torch.distributions.Poisson.log_prob()`
-- Results can be properly compared across different implementations
-
-**Technical details:**
-```
-log p(k|λ) = k*log(λ) - λ - log(k!)
-                        ^^^^^^^^^^
-                        Added this term
-```
-
-Using `torch.lgamma(X + 1)` since `lgamma(n+1) = log(n!)` by definition.
-
-**Verification:**
-```python
-# Manual computation now matches torch.distributions exactly
-log_prob_manual = X*torch.log(rate) - rate - torch.lgamma(X + 1)
-log_prob_torch = torch.distributions.Poisson(rate).log_prob(X)
-# log_prob_manual ≈ log_prob_torch (exact match)
-```

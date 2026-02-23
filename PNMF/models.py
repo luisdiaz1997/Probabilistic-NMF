@@ -123,7 +123,13 @@ class PoissonFactorization(nn.Module):
         """
         if spatial:
             # Spatial GP forward pass
-            if groups is not None:
+            # For LCGP, use forward_train() which returns marginal q(U_j) directly
+            # from stored parameters - much faster O(M*R) vs full GP predictive O(M^2)
+            # forward_train() returns (qF, qU, pU) where qU and pU are None
+            if hasattr(self.prior, 'forward_train'):
+                # LCGP: use forward_train() for efficient training
+                qF, qU, pU = self.prior.forward_train(X=coordinates, groupsX=groups, idx=idx)
+            elif groups is not None:
                 qF, qU, pU = self.prior(X=coordinates, groupsX=groups)
             else:
                 qF, qU, pU = self.prior(X=coordinates)
@@ -272,18 +278,20 @@ class PNMF:
     Spatial GP Parameters
     --------------------
     spatial : bool, default=False
-        Enable spatial GP prior (SVGP) instead of independent Gaussian prior.
-        Requires coordinates and groups to be provided in fit().
+        Enable spatial GP prior instead of independent Gaussian prior.
+        Requires coordinates to be provided in fit().
 
-    prior : str, default='GaussianPrior'
-        Type of prior to use. Auto-set to 'SVGP' when spatial=True.
+    local : bool, default=False
+        Use locally conditioned GP (LCGP) instead of SVGP when spatial=True.
+        LCGP uses all points as inducing with low-rank+diagonal covariance.
+        Only used when spatial=True.
 
     kernel : str, default='Matern32'
         Kernel function for spatial GP. Currently only 'Matern32' is supported.
 
     multigroup : bool, default=False
         Use multi-group GP (MGGP) with group-aware spatial smoothing.
-        When False, uses standard SVGP with batched_Matern32 kernel (no groups needed).
+        When False, uses standard GP with batched_Matern32 kernel (no groups needed).
 
     num_inducing : int, default=3000
         Number of inducing points for SVGP approximation.
@@ -310,12 +318,22 @@ class PNMF:
         Use diagonal-only variational covariance for inducing points.
 
     inducing_allocation : str, default='proportional'
-        How to distribute inducing points across groups:
+        How to distribute inducing points across groups (SVGP only):
         - 'proportional': Allocate points proportionally to group sizes (default).
         - 'equal': Allocate equal points to each group.
         - 'derived': Run K-means on all data for optimal spatial coverage,
           then use KNN (k=5, distance-weighted) to classify centroids to groups.
           Falls back to proportional for groups with no assigned points.
+
+    LCGP-Specific Parameters
+    ------------------------
+    K : int, default=50
+        Number of nearest neighbors for LCGP local conditioning.
+        Only used when local=True.
+
+    precompute_knn : bool, default=True
+        Whether to precompute KNN indices at initialization for LCGP.
+        Only used when local=True.
 
     Attributes
     ----------
@@ -378,7 +396,7 @@ class PNMF:
         shuffle: bool = True,
         # Spatial GP parameters
         spatial: bool = False,
-        prior: str = 'GaussianPrior',
+        local: bool = False,
         kernel: str = 'Matern32',
         multigroup: bool = False,
         num_inducing: int = 3000,
@@ -390,6 +408,9 @@ class PNMF:
         cholesky_mode: str = 'exp',
         diagonal_only: bool = False,
         inducing_allocation: str = 'proportional',
+        # LCGP-specific parameters
+        K: int = 50,
+        precompute_knn: bool = True,
     ):
         self.n_components = n_components
         self.loadings_mode = loadings_mode
@@ -419,7 +440,7 @@ class PNMF:
 
         # Spatial GP parameters
         self.spatial = spatial
-        self.prior_type = prior
+        self.local = local
         self.kernel = kernel
         self.multigroup = multigroup
         self.num_inducing = num_inducing
@@ -432,9 +453,15 @@ class PNMF:
         self.diagonal_only = diagonal_only
         self.inducing_allocation = inducing_allocation
 
-        # Auto-set prior type when spatial=True
-        if self.spatial and prior == 'GaussianPrior':
-            self.prior_type = 'SVGP'
+        # LCGP-specific parameters
+        self.K = K
+        self.precompute_knn = precompute_knn
+
+        # Derive prior type from spatial and local flags
+        if self.spatial:
+            self.prior_type = 'LCGP' if self.local else 'SVGP'
+        else:
+            self.prior_type = 'GaussianPrior'
 
         # Attributes set during fit
         self.components_ = None
@@ -450,6 +477,7 @@ class PNMF:
         self._w_scheduler = None
         self._coordinates = None
         self._groups = None
+        self._knn_idx = None  # For LCGP: stores KNN indices
 
     def _validate_params(self):
         """Validate input parameters."""
@@ -496,17 +524,33 @@ class PNMF:
             raise ValueError("y_batch_size must be >= 1 or None")
 
         # Spatial parameter validation
+        if self.local and not self.spatial:
+            raise ValueError("local=True requires spatial=True")
+
         if self.spatial:
-            if self.prior_type not in ['SVGP']:
-                raise ValueError("When spatial=True, prior must be 'SVGP'")
             if self.kernel not in ['Matern32']:
                 raise ValueError("kernel must be 'Matern32'")
             if self.training_mode == 'natural':
                 raise ValueError("Natural gradient training not supported with spatial priors")
             if self.inducing_allocation not in ['proportional', 'equal', 'derived']:
                 raise ValueError("inducing_allocation must be 'proportional', 'equal', or 'derived'")
-            if self.num_inducing < 1:
-                raise ValueError("num_inducing must be >= 1")
+
+            # SVGP-specific validation
+            if not self.local:
+                if self.num_inducing < 1:
+                    raise ValueError("num_inducing must be >= 1")
+
+            # LCGP-specific validation
+            if self.local:
+                if self.K < 1:
+                    raise ValueError("K must be >= 1 for LCGP")
+                # Warn if num_inducing is set (LCGP ignores it)
+                if self.num_inducing != 3000:  # Default value
+                    import warnings
+                    warnings.warn(
+                        f"num_inducing is ignored when local=True (LCGP uses all points as inducing). "
+                        f"Current setting: num_inducing={self.num_inducing}"
+                    )
 
     def _get_device(self):
         """Determine the device to use."""
@@ -573,7 +617,7 @@ class PNMF:
 
     def _create_spatial_prior(self, Y, coordinates, groups):
         """
-        Create MGGP_SVGP or SVGP prior for spatial mode.
+        Create spatial GP prior (SVGP or LCGP) for spatial mode.
 
         Args:
             Y: Data tensor of shape (D, N)
@@ -581,13 +625,14 @@ class PNMF:
             groups: Group assignments tensor of shape (N,), or None
 
         Returns:
-            gp: GP model (MGGP_SVGP or SVGP) ready for use as prior
+            gp: GP model (SVGP, MGGP_SVGP, LCGP, or MGGP_LCGP) ready for use as prior
         """
         try:
             from gpzoo.kernels import batched_MGGP_Matern32, batched_Matern32
-            from gpzoo.gp import MGGP_SVGP, SVGP
+            from gpzoo.gp import MGGP_SVGP, SVGP, LCGP, MGGP_LCGP
             from gpzoo.modules import CholeskyParameter
             from gpzoo.model_utilities import mggp_kmeans_inducing_points, kmeans_inducing_points
+            from gpzoo.utilities import init_Lu as gpzoo_init_Lu, init_Lu_nsf  # noqa: F401
         except ImportError:
             raise ImportError(
                 "GPzoo is required for spatial mode. "
@@ -598,7 +643,7 @@ class PNMF:
         L = self.n_components
         n_groups = int(groups.max().item() + 1) if groups is not None else 1
 
-        # 1. Create kernel
+        # 1. Create kernel (same for SVGP and LCGP)
         if self.multigroup and groups is not None:
             kernel = batched_MGGP_Matern32(
                 sigma=self.sigma,
@@ -612,54 +657,97 @@ class PNMF:
                 lengthscale=self.lengthscale,
             )
 
-        # 2. Select inducing points
-        M = min(self.num_inducing, N)
-        if self.multigroup and groups is not None:
-            Z, groupsZ = mggp_kmeans_inducing_points(
-                coordinates, groups, M,
-                seed=self.random_state or 123,
-                allocation=self.inducing_allocation,
+        # 2. Branch on prior type: SVGP vs LCGP
+        if self.prior_type == 'SVGP':
+            # === SVGP: Use subset of inducing points ===
+            M = min(self.num_inducing, N)
+            if self.multigroup and groups is not None:
+                Z, groupsZ = mggp_kmeans_inducing_points(
+                    coordinates, groups, M,
+                    seed=self.random_state or 123,
+                    allocation=self.inducing_allocation,
+                )
+                # derived allocation may return fewer points than requested
+                M = Z.shape[0]
+            else:
+                Z = kmeans_inducing_points(
+                    coordinates, M,
+                    seed=self.random_state or 123,
+                )
+                groupsZ = None
+
+            # 3. Create GP
+            if self.multigroup and groups is not None:
+                gp = MGGP_SVGP(
+                    kernel, dim=coordinates.shape[1], M=M, n_groups=n_groups,
+                    jitter=self.jitter, cholesky_mode=self.cholesky_mode,
+                    diagonal_only=self.diagonal_only,
+                )
+                gp.Z = nn.Parameter(Z, requires_grad=False)
+                gp.groupsZ = nn.Parameter(groupsZ, requires_grad=False)
+            else:
+                gp = SVGP(
+                    kernel, dim=coordinates.shape[1], M=M,
+                    jitter=self.jitter, cholesky_mode=self.cholesky_mode,
+                    diagonal_only=self.diagonal_only,
+                )
+                gp.Z = nn.Parameter(Z, requires_grad=False)
+
+            # 4. Batch mu and Lu for L latent factors
+            #    SVGP creates mu (M,) and Lu (M, M) for a single output.
+            #    We need (L, M) and (L, M, M) for L latent factors.
+            del gp.Lu
+            gp.Lu = CholeskyParameter(
+                (L, M), mode=self.cholesky_mode, diagonal_only=self.diagonal_only
             )
+            Lu_init = torch.randn(L, M, M) * 1e-2
+            Lu_init = torch.tril(Lu_init)
+            Lu_init[:, range(M), range(M)] = torch.rand(L, M)
+            gp.Lu.data = Lu_init
+            gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
+
+        elif self.local:
+            # === LCGP: Use ALL points as inducing points ===
+            M = N  # LCGP uses all points as inducing points
+            Z = coordinates.clone()  # All points are inducing points
+            K = self.K
+            if self.multigroup and groups is not None:
+                groupsZ = groups.clone()
+            else:
+                groupsZ = None
+
+            # 3. Create GP
+            if self.multigroup and groups is not None:
+                gp = MGGP_LCGP(
+                    kernel, dim=coordinates.shape[1], M=M, n_groups=n_groups,
+                    jitter=self.jitter, K=K,
+                )
+                gp.Z = nn.Parameter(Z, requires_grad=False)
+                gp.groupsZ = nn.Parameter(groupsZ, requires_grad=False)
+            else:
+                gp = LCGP(
+                    kernel, dim=coordinates.shape[1], M=M,
+                    jitter=self.jitter, K=K,
+                )
+                gp.Z = nn.Parameter(Z, requires_grad=False)
+
+            # 4. Initialize Lu as raw nn.Parameter (same approach as VNNGP)
+            #    Lu shape: (L, M, K) for L latent factors
+            del gp.Lu
+            gp.Lu = nn.Parameter(torch.randn(L, M, K) * 1e-1)
+
+            # Initialize mu: random N(0, 1)
+            gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
+
+            # 5. Precompute KNN indices (always needed for training)
+            knn_idx = gp.calculate_knn(coordinates)[:, :-1]  # Exclude self
+            gp.knn_idx = knn_idx
+            gp.knn_idz = knn_idx  # For LCGP, knn_idx == knn_idz since Z = X
+
         else:
-            # K-means inducing point selection for non-multigroup
-            Z = kmeans_inducing_points(
-                coordinates, M,
-                seed=self.random_state or 123,
-            )
-            groupsZ = None
+            raise ValueError(f"Unknown prior type: {self.prior_type}")
 
-        # 3. Create GP
-        if self.multigroup and groups is not None:
-            gp = MGGP_SVGP(
-                kernel, dim=coordinates.shape[1], M=M, n_groups=n_groups,
-                jitter=self.jitter, cholesky_mode=self.cholesky_mode,
-                diagonal_only=self.diagonal_only,
-            )
-            gp.Z = nn.Parameter(Z, requires_grad=False)
-            gp.groupsZ = nn.Parameter(groupsZ, requires_grad=False)
-        else:
-            gp = SVGP(
-                kernel, dim=coordinates.shape[1], M=M,
-                jitter=self.jitter, cholesky_mode=self.cholesky_mode,
-                diagonal_only=self.diagonal_only,
-            )
-            gp.Z = nn.Parameter(Z, requires_grad=False)
-
-        # 4. Batch mu and Lu for L latent factors
-        #    SVGP creates mu (M,) and Lu (M, M) for a single output.
-        #    We need (L, M) and (L, M, M) for L latent factors.
-        from gpzoo.modules import CholeskyParameter
-        del gp.Lu
-        gp.Lu = CholeskyParameter(
-            (L, M), mode=self.cholesky_mode, diagonal_only=self.diagonal_only
-        )
-        Lu_init = torch.randn(L, M, M) * 1e-2
-        Lu_init = torch.tril(Lu_init)
-        Lu_init[:, range(M), range(M)] = torch.rand(L, M)
-        gp.Lu.data = Lu_init
-        gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
-
-        # 5. Freeze kernel hyperparameters
+        # 6. Freeze kernel hyperparameters
         #    By default we freeze all kernel params (lengthscale, sigma, group_diff_param).
         #    Only lengthscale can be optionally unfrozen via train_lengthscale=True.
         if not self.train_lengthscale:
@@ -830,6 +918,9 @@ class PNMF:
             self._prior = self._create_spatial_prior(
                 X_torch, coords_torch, groups_torch
             ).to(device)
+            # Store KNN indices for LCGP (used during mini-batch training)
+            if self.local:
+                self._knn_idx = self._prior.knn_idz.clone()
         else:
             use_natural_gradients = (self.training_mode == 'natural')
             self._prior = GaussianPrior(
@@ -984,8 +1075,18 @@ class PNMF:
                 coords_batch = coords_torch[idx] if idx is not None else coords_torch
                 groups_batch = groups_torch[idx] if (idx is not None and groups_torch is not None) else groups_torch
 
+                # For LCGP: Set per-batch KNN indices for forward_train()
+                # knn_idx = sliced for forward pass; knn_idz = FULL for kl_divergence_full
+                if self.local:
+                    knn_idx = self._knn_idx[idx.cpu()] if idx is not None else self._knn_idx
+                    self._prior.knn_idx = knn_idx
+                    # knn_idz stays as full indices (set during _create_spatial_prior)
+
+                # For LCGP: pass idx so forward_train() indexes into mu/Lu
+                # For SVGP: idx=None since GP gets coordinate batch directly
+                spatial_idx = idx if self.local else None
                 terms, qF, qU, pU = self._model.forward(
-                    idx=None, idy=idy, E=self.E, X=X_batch,
+                    idx=spatial_idx, idy=idy, E=self.E, X=X_batch,
                     coordinates=coords_batch, groups=groups_batch, spatial=True
                 )
 
@@ -993,11 +1094,17 @@ class PNMF:
                 from .elbo import expected_log_likelihood as exp_ll_fn
                 exp_ll = exp_ll_fn(self.mode, terms, X_batch)
 
-                # Compute KL divergence via GP's method (whitened KL on inducing points)
-                # GP returns per-factor KL (shape (L,)), sum over factors
-                # Scale by N/M to match non-spatial KL-to-likelihood ratio
-                M = self._prior.Z.shape[0]
-                kl = self._prior.kl_divergence(qU, pU).sum() * (N / M)
+                # Compute KL divergence (different for SVGP vs LCGP)
+                if self.local:
+                    # LCGP: Locally conditioned KL over batch points
+                    # Scales with x_batch like non-spatial KL
+                    kl = self._prior.kl_divergence_full(qZ=None, idx=idx).sum()
+                else:
+                    # SVGP: Whitened KL on inducing points (global)
+                    # GP returns per-factor KL (shape (L,)), sum over factors
+                    # Scale by N/M to match non-spatial KL-to-likelihood ratio
+                    M = self._prior.Z.shape[0]
+                    kl = self._prior.kl_divergence(qU, pU).sum() * (N / M)
 
                 # Scale expected log-likelihood for feature mini-batch
                 if self.y_batch_size is not None:
@@ -1007,7 +1114,9 @@ class PNMF:
                 if self.batch_size is not None:
                     exp_ll = exp_ll * (N / min(self.batch_size, N))
 
-                # KL is over inducing points (global), NOT data - no N-scaling needed
+                # LCGP: KL scales with x_batch (like non-spatial), needs N-scaling
+                if self.local and self.batch_size is not None:
+                    kl = kl * (N / min(self.batch_size, N))
             else:
                 # Standard (non-spatial) forward pass
                 terms, qF, pF = self._model.forward(idx, idy, E=self.E, X=X_batch)
@@ -1171,6 +1280,11 @@ class PNMF:
                 groups_t = None
 
             with torch.no_grad():
+                # For LCGP: set KNN indices before calling forward()
+                if self.local:
+                    knn_idx = self._prior.calculate_knn(coords_t)[:, :-1]
+                    self._prior.knn_idx = knn_idx
+
                 if groups_t is not None:
                     qF, _, _ = self._prior(X=coords_t, groupsX=groups_t)
                 else:
