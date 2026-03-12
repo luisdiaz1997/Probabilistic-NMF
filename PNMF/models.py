@@ -411,6 +411,9 @@ class PNMF:
         # LCGP-specific parameters
         K: int = 50,
         precompute_knn: bool = True,
+        # ELBO scaling flags (default True = correct behaviour; False = old/broken for video demos)
+        scale_ll_D: bool = True,
+        scale_kl_NM: bool = True,
     ):
         self.n_components = n_components
         self.loadings_mode = loadings_mode
@@ -456,6 +459,10 @@ class PNMF:
         # LCGP-specific parameters
         self.K = K
         self.precompute_knn = precompute_knn
+
+        # ELBO scaling flags
+        self.scale_ll_D = scale_ll_D
+        self.scale_kl_NM = scale_kl_NM
 
         # Derive prior type from spatial and local flags
         if self.spatial:
@@ -830,7 +837,9 @@ class PNMF:
         y: Optional[Union[np.ndarray, torch.Tensor]] = None,
         coordinates: Optional[Union[np.ndarray, torch.Tensor]] = None,
         groups: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        return_history: bool = False
+        return_history: bool = False,
+        callback=None,
+        callback_interval: int = 100,
     ) -> Union['PNMF', tuple[list[float], 'PNMF']]:
         """
         Fit the PNMF model to data X using variational inference.
@@ -1104,10 +1113,13 @@ class PNMF:
                     # GP returns per-factor KL (shape (L,)), sum over factors
                     # Scale by N/M to match non-spatial KL-to-likelihood ratio
                     M = self._prior.Z.shape[0]
-                    kl = self._prior.kl_divergence(qU, pU).sum() * (N / M)
+                    if self.scale_kl_NM:
+                        kl = self._prior.kl_divergence(qU, pU).sum() * (N / M)
+                    else:
+                        kl = self._prior.kl_divergence(qU, pU).sum()
 
                 # Scale expected log-likelihood for feature mini-batch
-                if self.y_batch_size is not None:
+                if self.y_batch_size is not None and self.scale_ll_D:
                     exp_ll = exp_ll * (D / min(self.y_batch_size, D))
 
                 # Scale expected log-likelihood for sample mini-batch
@@ -1125,7 +1137,7 @@ class PNMF:
                 exp_ll, kl = compute_elbo(self.mode, terms, qF, pF, X_batch)
 
                 # Scale expected log-likelihood for feature mini-batch
-                if self.y_batch_size is not None:
+                if self.y_batch_size is not None and self.scale_ll_D:
                     exp_ll = exp_ll * (D / min(self.y_batch_size, D))
 
                 # Scale expected log-likelihood for sample mini-batch
@@ -1166,6 +1178,10 @@ class PNMF:
             # Track ELBO history
             if return_history:
                 elbo_history.append(elbo_value)
+
+            # Fire optional callback every callback_interval iterations
+            if callback is not None and iteration % callback_interval == 0:
+                callback(self, iteration, elbo_value)
 
             # Update EMA of ELBO and step scheduler
             if ema_elbo is None:
