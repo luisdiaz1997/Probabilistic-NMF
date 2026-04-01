@@ -639,7 +639,7 @@ class PNMF:
             from gpzoo.gp import MGGP_SVGP, SVGP, LCGP, MGGP_LCGP
             from gpzoo.modules import CholeskyParameter
             from gpzoo.model_utilities import mggp_kmeans_inducing_points, kmeans_inducing_points
-            from gpzoo.utilities import init_Lu as gpzoo_init_Lu, init_Lu_nsf  # noqa: F401
+            from gpzoo.utilities import init_Lu as gpzoo_init_Lu, init_Lu_nsf, estimate_lcgp_rank  # noqa: F401
         except ImportError:
             raise ImportError(
                 "GPzoo is required for spatial mode. "
@@ -739,9 +739,14 @@ class PNMF:
                 gp.Z = nn.Parameter(Z, requires_grad=False)
 
             # 4. Initialize Lu as raw nn.Parameter (same approach as VNNGP)
-            #    Lu shape: (L, M, K) for L latent factors
+            #    Lu shape: (L, M, R) where R is the data-driven spectral rank
+            #    (number of Fourier modes needed for 99% kernel variance coverage)
+            coords_np = coordinates.cpu().numpy()
+            domain_range = (float(coords_np.min()), float(coords_np.max()))
+            R = estimate_lcgp_rank(self.lengthscale, domain_range, dim=2, p=0.9)
+            R = max(1, min(R, 250))  # clamp to avoid OOM in Lu_knn intermediate
             del gp.Lu
-            gp.Lu = nn.Parameter(torch.randn(L, M, K) * 1e-1)
+            gp.Lu = nn.Parameter(torch.randn(L, M, R) * (1.0 / R ** 0.5))
 
             # Initialize mu: random N(0, 1)
             gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
