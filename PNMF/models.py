@@ -411,6 +411,7 @@ class PNMF:
         # LCGP-specific parameters
         K: int = 50,
         precompute_knn: bool = True,
+        neighbors: str = "knn",
         # ELBO scaling flags (default True = correct behaviour; False = old/broken for video demos)
         scale_ll_D: bool = True,
         scale_kl_NM: bool = True,
@@ -459,6 +460,7 @@ class PNMF:
         # LCGP-specific parameters
         self.K = K
         self.precompute_knn = precompute_knn
+        self.neighbors = neighbors
 
         # ELBO scaling flags
         self.scale_ll_D = scale_ll_D
@@ -752,9 +754,14 @@ class PNMF:
             gp.mu = nn.Parameter(torch.randn(L, M) * 1.0)
 
             # 5. Precompute KNN indices (always needed for training)
-            knn_idx = gp.calculate_knn(coordinates)[:, :-1]  # Exclude self
-            gp.knn_idx = knn_idx
-            gp.knn_idz = knn_idx  # For LCGP, knn_idx == knn_idz since Z = X
+            from gpzoo.knn_utilities import calculate_knn
+            raw = calculate_knn(
+                gp, coordinates, strategy=self.neighbors,
+                multigroup=self.multigroup and groups is not None,
+                groupsX=groups, groupsZ=groups,
+            )  # (N, K+1) with self at column 0
+            gp.knn_idx = raw[:, :-1]   # self-inclusive — used at inference (forward pass)
+            gp.knn_idz = raw[:, 1:]    # self-exclusive — used at training (KL divergence)
 
         else:
             raise ValueError(f"Unknown prior type: {self.prior_type}")
@@ -1303,7 +1310,12 @@ class PNMF:
             with torch.no_grad():
                 # For LCGP: set KNN indices before calling forward()
                 if self.local:
-                    knn_idx = self._prior.calculate_knn(coords_t)[:, :-1]
+                    from gpzoo.knn_utilities import calculate_knn
+                    knn_idx = calculate_knn(
+                        self._prior, coords_t, strategy=self.neighbors,
+                        multigroup=self.multigroup,
+                        groupsX=groups_t, groupsZ=self._groups,
+                    )[:, :-1]
                     self._prior.knn_idx = knn_idx
 
                 if groups_t is not None:

@@ -60,7 +60,15 @@ def _get_spatial_qF(model, coordinates=None, groups=None):
     with torch.no_grad():
         # For LCGP: set KNN indices before calling forward()
         if hasattr(model, 'local') and model.local:
-            knn_idx = model._prior.calculate_knn(coords)[:, :-1]
+            from gpzoo.knn_utilities import calculate_knn
+            neighbors = getattr(model, 'neighbors', 'knn')
+            grps_for_knn = grps if (hasattr(model, 'multigroup') and model.multigroup) else None
+            groupsZ_for_knn = model._groups if grps_for_knn is not None else None
+            knn_idx = calculate_knn(
+                model._prior, coords, strategy=neighbors,
+                multigroup=grps_for_knn is not None,
+                groupsX=grps_for_knn, groupsZ=groupsZ_for_knn,
+            )[:, :-1]
             model._prior.knn_idx = knn_idx
 
         if grps is not None:
